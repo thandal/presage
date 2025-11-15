@@ -12,7 +12,7 @@ use directories::ProjectDirs;
 use futures::StreamExt;
 use futures::{channel::oneshot, future, pin_mut};
 use mime_guess::mime::APPLICATION_OCTET_STREAM;
-use notify_rust::Notification;
+// use notify_rust::Notification;
 use presage::libsignal_service::configuration::SignalServers;
 use presage::libsignal_service::content::Reaction;
 use presage::libsignal_service::pre_keys::PreKeysStore;
@@ -530,14 +530,14 @@ async fn print_message<S: Store>(
         println!("{prefix} / {body}");
 
         if notifications {
-            if let Err(error) = Notification::new()
-                .summary(&prefix)
-                .body(&body)
-                .icon("presage")
-                .show()
-            {
-                error!(%error, "failed to display desktop notification");
-            }
+            //if let Err(error) = Notification::new()
+            //    .summary(&prefix)
+            //    .body(&body)
+            //    .icon("presage")
+            //    .show()
+            //{
+            //    error!(%error, "failed to display desktop notification");
+            //}
         }
     }
 }
