@@ -1,3 +1,16 @@
+# cargo-features = ["edition2024"]
+# [package]
+# name = "presage-cli"
+
+# Quest for binary < 10 Mb!!!
+# See: ttps://github.com/johnthagen/min-sized-rust
+[profile.release]
+opt-level = "z"  # Optimize for size.  "s" isn't quite as small
+strip = true  # Automatically strip symbols from the binary.
+lto = true
+panic = "abort"
+codegen-units = 1
+
 [workspace]
 members = ["presage", "presage-cli", "presage-store-sled", "presage-store-cipher", "presage-store-sqlite"]
 resolver = "2"
