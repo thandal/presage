@@ -12,7 +12,7 @@ use directories::ProjectDirs;
 use futures::StreamExt;
 use futures::{channel::oneshot, future, pin_mut};
 use mime_guess::mime::APPLICATION_OCTET_STREAM;
-// use notify_rust::Notification;
+use notify_rust::Notification;
 use presage::libsignal_service::configuration::SignalServers;
 use presage::libsignal_service::content::Reaction;
 use presage::libsignal_service::pre_keys::PreKeysStore;
@@ -131,6 +131,8 @@ enum Cmd {
     Receive {
         #[clap(long = "notifications", short = 'n')]
         notifications: bool,
+        #[clap(long, help = "Stream messages indefinitely. If False, will return after processing the current queue of messages.")]
+        nostream: bool,
     },
     #[clap(about = "List groups")]
     ListGroups,
@@ -545,6 +547,7 @@ async fn print_message<S: Store>(
 async fn receive<S: Store>(
     manager: &mut Manager<S, Registered>,
     notifications: bool,
+    nostream: bool,
 ) -> anyhow::Result<()> {
     let attachments_tmp_dir = attachments_tmp_dir()?;
     let messages = manager
@@ -556,8 +559,10 @@ async fn receive<S: Store>(
     while let Some(content) = messages.next().await {
         match content {
             Received::QueueEmpty => {
-              println!("done with synchronization");
-              break;
+                if nostream {
+                    println!("done with synchronization");
+                    break;
+                }
             }
             Received::Contacts => println!("got contacts synchronization"),
             Received::Content(content) => {
@@ -675,9 +680,9 @@ async fn run<S: Store>(subcommand: Cmd, config_store: S) -> anyhow::Result<()> {
                 );
             }
         }
-        Cmd::Receive { notifications } => {
+        Cmd::Receive { notifications, nostream } => {
             let mut manager = Manager::load_registered(config_store).await?;
-            receive(&mut manager, notifications).await?;
+            receive(&mut manager, notifications, nostream).await?;
         }
         Cmd::Send {
             uuid,
