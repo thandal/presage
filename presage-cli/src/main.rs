@@ -12,7 +12,7 @@ use directories::ProjectDirs;
 use futures::StreamExt;
 use futures::{channel::oneshot, future, pin_mut};
 use mime_guess::mime::APPLICATION_OCTET_STREAM;
-use notify_rust::Notification;
+// use notify_rust::Notification;
 use presage::libsignal_service::configuration::SignalServers;
 use presage::libsignal_service::content::Reaction;
 use presage::libsignal_service::pre_keys::PreKeysStore;
@@ -993,7 +993,7 @@ async fn load_registered_and_receive<S: Store + Send>(
 ) -> anyhow::Result<Manager<S, Registered>> {
     let manager = Manager::load_registered(store).await?;
     let manager_receive = manager.clone();
-    tokio::task::spawn_local(receive(manager_receive, false));
+    tokio::task::spawn_local(receive(manager_receive, false, true));
     Ok(manager)
 }
 

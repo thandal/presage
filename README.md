@@ -39,6 +39,10 @@ and look at the generated Rust documentation of the `Manager` struct to get star
 
 Included in this repository is a nearly fully functional CLI that can serve as an example to build your client (you can also use it to query your `presage` database):
 
+1. Install rust https://rust-lang.org/tools/install/
+2. Make sure you have openssl-dev and protoc installed, `sudo apt-get install libssl-dev protobuf-compiler`
+3. You can then build with `cargo build --release`
+
 ```
 # print help section
 cargo run -- --help
