@@ -49,6 +49,11 @@ use tracing::warn;
 use tracing::{debug, error, info};
 use url::Url;
 
+fn parse_service_id(input: &str) -> Result<ServiceId, clap::Error> {
+    ServiceId::parse_from_service_id_string(input)
+        .ok_or_else(|| clap::Error::new(clap::error::ErrorKind::InvalidValue))
+}
+
 #[derive(Parser)]
 #[clap(about = "a basic signal CLI to try things out")]
 struct Args {
@@ -157,8 +162,8 @@ enum Cmd {
         )
     )]
     ListMessages {
-        #[clap(long, short = 'u', help = "recipient UUID")]
-        recipient_uuid: Option<Uuid>,
+        #[clap(long, short = 'u', help = "recipient service ID (no prefix defaults to ACI, otherwise PNI:[uuid])", value_parser = parse_service_id)]
+        recipient_service_id: Option<ServiceId>,
         #[clap(
             long,
             short = 'k',
@@ -171,14 +176,15 @@ enum Cmd {
     },
     #[clap(about = "List downloaded sticker packs")]
     ListStickerPacks,
-    #[clap(about = "Get a single contact by UUID")]
+    #[clap(about = "Get a single contact by service ID")]
     GetContact {
-        uuid: Uuid,
+        #[clap(long, value_parser = parse_service_id)]
+        id: ServiceId,
     },
     #[clap(about = "Find a contact in the embedded DB")]
     FindContact {
-        #[clap(long, short = 'u', help = "contact UUID")]
-        uuid: Option<Uuid>,
+        #[clap(long, short = 'u', help = "contact service ID", value_parser = parse_service_id)]
+        id: Option<ServiceId>,
         #[clap(long, short = 'p', help = "contact phone number")]
         phone_number: Option<PhoneNumber>,
         #[clap(long, short = 'n', help = "contact name")]
@@ -203,6 +209,18 @@ enum Cmd {
         attachment_filepath: Vec<PathBuf>,
     },
     SyncContacts,
+    #[clap(
+        about = "Resolves one or multiple phone numbers to their possible account identity identifier"
+    )]
+    #[cfg(feature = "cdsi")]
+    ResolvePhoneNumber {
+        #[clap(long, short = 'p')]
+        phone_number: Vec<PhoneNumber>,
+    },
+    LookupUsername {
+        #[clap(long, short = 'u')]
+        username: String,
+    },
     #[clap(about = "Print various statistics useful for debugging")]
     Stats,
 }
@@ -430,16 +448,16 @@ async fn print_message<S: Store>(
         }
     }
 
-    async fn format_contact<S: Store>(uuid: &Uuid, manager: &Manager<S, Registered>) -> String {
+    async fn format_contact<S: Store>(id: &ServiceId, manager: &Manager<S, Registered>) -> String {
         manager
             .store()
-            .contact_by_id(uuid)
+            .contact_by_id(id)
             .await
             .ok()
             .flatten()
             .filter(|c| !c.name.is_empty())
-            .map(|c| format!("{}: {}", c.name, uuid))
-            .unwrap_or_else(|| uuid.to_string())
+            .map(|c| format!("{}: {}", c.name, id.service_id_string()))
+            .unwrap_or_else(|| id.service_id_string())
     }
 
     async fn format_group<S: Store>(key: [u8; 32], manager: &Manager<S, Registered>) -> String {
@@ -530,7 +548,7 @@ async fn print_message<S: Store>(
                 (format!("To {contact} @ {ts}"), body)
             }
             Msg::Received(Thread::Group(key), body) => {
-                let sender = format_contact(&content.metadata.sender.raw_uuid(), manager).await;
+                let sender = format_contact(&content.metadata.sender, manager).await;
                 let group = format_group(*key, manager).await;
                 (format!("From {sender} to group {group} @ {ts}: "), body)
             }
@@ -856,15 +874,15 @@ async fn run<S: Store>(subcommand: Cmd, store: S) -> anyhow::Result<()> {
             let manager = load_registered_and_receive(store).await?;
             println!("{:?}", &manager.whoami().await?);
         }
-        Cmd::GetContact { ref uuid } => {
+        Cmd::GetContact { ref id } => {
             let manager = load_registered_and_receive(store).await?;
-            match manager.store().contact_by_id(uuid).await? {
+            match manager.store().contact_by_id(id).await? {
                 Some(contact) => println!("{contact:#?}"),
-                None => eprintln!("Could not find contact for {uuid}"),
+                None => eprintln!("Could not find contact for {}", id.service_id_string()),
             }
         }
         Cmd::FindContact {
-            uuid,
+            id,
             phone_number,
             ref name,
         } => {
@@ -874,7 +892,7 @@ async fn run<S: Store>(subcommand: Cmd, store: S) -> anyhow::Result<()> {
                 .contacts()
                 .await?
                 .filter_map(Result::ok)
-                .filter(|c| uuid.map_or_else(|| true, |u| c.uuid == u))
+                .filter(|c| id.map_or_else(|| true, |i| c.uuid == i.raw_uuid()))
                 .filter(|c| c.phone_number == phone_number)
                 .filter(|c| name.as_ref().is_none_or(|n| c.name.contains(n)))
             {
@@ -903,11 +921,11 @@ async fn run<S: Store>(subcommand: Cmd, store: S) -> anyhow::Result<()> {
         }
         Cmd::ListMessages {
             group_master_key,
-            recipient_uuid,
+            recipient_service_id,
             from,
         } => {
             let manager = load_registered_and_receive(store).await?;
-            let thread = match (group_master_key, recipient_uuid) {
+            let thread = match (group_master_key, recipient_service_id) {
                 (Some(master_key), _) => Thread::Group(master_key),
                 (_, Some(uuid)) => Thread::Contact(uuid),
                 _ => unreachable!(),
@@ -919,6 +937,29 @@ async fn run<S: Store>(subcommand: Cmd, store: S) -> anyhow::Result<()> {
                 .filter_map(Result::ok)
             {
                 print_message(&manager, false, &msg).await;
+            }
+        }
+        #[cfg(feature = "cdsi")]
+        Cmd::ResolvePhoneNumber { phone_number } => {
+            let mut manager = load_registered_and_receive(store).await?;
+            let resolved_account_identities = manager
+                .discover_contacts_by_phone_number(phone_number)
+                .await?;
+            for (phone_number, identity) in resolved_account_identities {
+                match identity {
+                    Some(identity) => {
+                        println!("{phone_number} => {}", identity.service_id_string())
+                    }
+                    None => println!("{phone_number} => no account"),
+                }
+            }
+        }
+        Cmd::LookupUsername { username } => {
+            let mut manager = load_registered_and_receive(store).await?;
+            let resolved_service_id = manager.lookup_username(&username).await?;
+            match resolved_service_id {
+                Some(service_id) => println!("{username} => {}", service_id.service_id_string()),
+                None => println!("{username} => no matching account found"),
             }
         }
         Cmd::Stats => {

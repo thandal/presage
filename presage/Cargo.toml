@@ -6,8 +6,12 @@ authors = ["Gabriel Féron <g@leirbag.net>"]
 edition = "2021"
 license = "AGPL-3.0-only"
 
+[features]
+default = ["cdsi"]
+cdsi = ["libsignal-service/cdsi"] # brings libsignal-net and all its dependencies
+
 [dependencies]
-libsignal-service = { git = "https://github.com/whisperfish/libsignal-service-rs", rev = "8bbad87b8878b9e4956cdad08d640def94c8a9cd" }
+libsignal-service = { git = "https://github.com/whisperfish/libsignal-service-rs", rev = "8a5d298f2c78f7c9cc41ecaee378618a0f22c843", default-features = false, features = ["phonenumber"] }
 
 base64 = "0.22"
 futures = "0.3"

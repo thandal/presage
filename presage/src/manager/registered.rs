@@ -3,18 +3,15 @@ use std::sync::{Arc, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use futures::{future, AsyncReadExt, Stream, StreamExt};
-use libsignal_service::prelude::MasterKey;
-use libsignal_service::websocket::account::{
-    AccountAttributes, DeviceCapabilities, DeviceInfo, WhoAmIResponse,
-};
 use libsignal_service::{
     attachment_cipher::decrypt_in_place,
     cipher,
-    configuration::{ServiceConfiguration, SignalServers, SignalingKey},
+    configuration::{ServiceConfiguration, SignalServers},
     content::{Content, ContentBody, DataMessageFlags, Metadata},
+    encrypt_device_name,
     groups_v2::{decrypt_group, GroupsManager, InMemoryCredentialsCache},
     messagepipe::{Incoming, MessagePipe, ServiceCredentials},
-    prelude::{phonenumber::PhoneNumber, DeviceId, MessageSenderError, ProtobufMessage, Uuid},
+    prelude::{phonenumber::PhoneNumber, MasterKey, MessageSenderError, ProtobufMessage, Uuid},
     profile_cipher::ProfileCipher,
     proto::{
         data_message::Delete,
@@ -22,16 +19,21 @@ use libsignal_service::{
         AttachmentPointer, DataMessage, EditMessage, GroupContextV2, NullMessage, SyncMessage,
         Verified,
     },
-    protocol::{Aci, IdentityKeyStore, SenderCertificate, ServiceId, ServiceIdKind},
+    protocol::{
+        Aci, DeviceId, IdentityKeyStore, SenderCertificate, ServiceId, ServiceIdKind, Username,
+    },
     provisioning::ProvisioningError,
     push_service::{PushService, ServiceIds, DEFAULT_DEVICE_ID},
     receiver::MessageReceiver,
     sender::{AttachmentSpec, AttachmentUploadError},
     sticker_cipher::derive_key,
     unidentified_access::UnidentifiedAccess,
-    utils::serde_signaling_key,
-    websocket,
-    websocket::SignalWebSocket,
+    utils::TryIntoE164,
+    websocket::{
+        self,
+        account::{AccountAttributes, DeviceCapabilities, DeviceInfo, WhoAmIResponse},
+        SignalWebSocket,
+    },
     zkgroup::{
         groups::{GroupMasterKey, GroupSecretParams},
         profiles::ProfileKey,
@@ -90,8 +92,12 @@ impl Registered {
         }
     }
 
+    fn servers(&self) -> SignalServers {
+        self.data.signal_servers
+    }
+
     fn service_configuration(&self) -> ServiceConfiguration {
-        self.data.signal_servers.into()
+        self.servers().into()
     }
 
     pub fn device_id(&self) -> DeviceId {
@@ -104,11 +110,7 @@ impl Registered {
     pub(crate) fn identified_push_service(&self) -> PushService {
         self.identified_push_service
             .get_or_init(|| {
-                PushService::new(
-                    self.service_configuration(),
-                    Some(self.credentials()),
-                    crate::USER_AGENT,
-                )
+                PushService::new(self.servers(), Some(self.credentials()), crate::USER_AGENT)
             })
             .clone()
     }
@@ -117,9 +119,10 @@ impl Registered {
         ServiceCredentials {
             aci: Some(self.data.service_ids.aci),
             pni: Some(self.data.service_ids.pni),
-            phonenumber: self.data.phone_number.clone(),
+            phonenumber: (&self.data.phone_number)
+                .try_into_e164()
+                .expect("valid phone number"),
             password: Some(self.data.password.clone()),
-            signaling_key: Some(self.data.signaling_key),
             device_id: self.data.device_id.and_then(|d| d.try_into().ok()),
         }
     }
@@ -134,8 +137,6 @@ pub struct RegistrationData {
     #[serde(flatten)]
     pub service_ids: ServiceIds,
     pub(crate) password: String,
-    #[serde(with = "serde_signaling_key")]
-    pub(crate) signaling_key: SignalingKey,
     pub device_id: Option<u32>,
     pub registration_id: u32,
     #[serde(default)]
@@ -205,9 +206,7 @@ impl<S: Store> Manager<S, Registered> {
     fn unidentified_push_service(&self) -> PushService {
         self.state
             .unidentified_push_service
-            .get_or_init(|| {
-                PushService::new(self.state.service_configuration(), None, crate::USER_AGENT)
-            })
+            .get_or_init(|| PushService::new(self.state.servers(), None, crate::USER_AGENT))
             .clone()
     }
 
@@ -557,29 +556,28 @@ impl<S: Store> Manager<S, Registered> {
         let store_inner = self.store.clone();
         let registration_data_inner = self.registration_data().clone();
 
-        // we make a task to update the account attributes and refresh pre keys as needed
-        // that will only yield a value if one of the two operations fail (stop signal)
+        // We make a task to update the account attributes and refresh pre keys as needed that will
+        // only yield a value if one of the two operations fail (stop signal).
         //
-        // this is necessary because in this context, we can't do the classic tokio::spawn
-        // with a oneshot::channel() or CancellationToken because of !Send constraints in the Store.
+        // This is necessary because in this context, we can't do the classic tokio::spawn with a
+        // oneshot::channel() or CancellationToken because of !Send constraints in the Store.
         let refresh_registration_task = async move {
             if let Err(error) =
-                set_account_attributes::<S>(&mut account_manager, &registration_data_inner).await
+                set_account_attributes(&mut account_manager, &store_inner, &registration_data_inner)
+                    .await
             {
                 error!(%error, "failed to set account attributes, this is problematic and should never happen!");
-                return Some(()); // stop signal
-            } else if let Err(error) = register_pre_keys(&store_inner, &mut account_manager).await {
-                error!(%error, "failed to register pre-keys, this is problematic and should never happen!");
-                return Some(()); // stop signal
             }
 
-            future::pending::<()>().await; // hack: wait forever (non-busy loop)
-            None
+            if let Err(error) = register_pre_keys(&store_inner, &mut account_manager).await {
+                error!(%error, "failed to register pre-keys, this is problematic and should never happen!");
+            }
+
+            // Never return, which keeps the messages stream alive.
+            future::pending::<()>().await
         };
 
-        let credentials = self.credentials();
-        let encrypted_messages =
-            MessagePipe::from_socket(identified_websocket.clone(), credentials);
+        let encrypted_messages = MessagePipe::from_socket(identified_websocket.clone());
 
         let init = StreamState {
             store: self.store.clone(),
@@ -647,10 +645,14 @@ impl<S: Store> Manager<S, Registered> {
                                                             .unwrap_or_default()
                                                     })
                                                     .unwrap_or_default();
-                                                let result = state
-                                                    .message_sender
+
+                                                let mut message_sender =
+                                                    state.message_sender.clone();
+                                                let aci = state.service_ids.aci();
+                                                tokio::task::spawn_local(async move {
+                                                    let result = message_sender
                                                     .send_contact_details(
-                                                        &ServiceId::Aci(state.service_ids.aci()),
+                                                        &ServiceId::Aci(aci),
                                                         None,
                                                         contacts.into_iter().map(|c| libsignal_service::sender::ContactDetails {
                                                             number: c.phone_number.map(|p| p.to_string()),
@@ -669,27 +671,36 @@ impl<S: Store> Manager<S, Registered> {
                                                         true,
                                                     )
                                                     .await;
-                                                if let Err(error) = result {
-                                                    warn!(%error, "Error sending contact details to other devices");
-                                                }
+
+                                                    if let Err(error) = result {
+                                                        warn!(%error, "Error sending contact details to other devices");
+                                                    }
+                                                });
                                             }
                                             RequestType::Keys => {
-                                                let result = state.message_sender.send_sync_message(SyncMessage {
-                                                    keys: Some(libsignal_service::content::sync_message::Keys {
-                                                        master: Some(state.master_key.inner.to_vec()),
-                                                        account_entropy_pool: None,
-                                                        media_root_backup_key: None,
-                                                    }),
-                                                    ..SyncMessage::with_padding(&mut rand::rng())
-                                                }).await;
+                                                let mut message_sender =
+                                                    state.message_sender.clone();
+                                                tokio::task::spawn_local(async move {
+                                                    let result = message_sender.send_sync_message(SyncMessage {
+                                                        keys: Some(libsignal_service::content::sync_message::Keys {
+                                                            master: Some(state.master_key.inner.to_vec()),
+                                                            account_entropy_pool: None,
+                                                            media_root_backup_key: None,
+                                                        }),
+                                                        ..SyncMessage::with_padding(&mut rand::rng())
+                                                    }).await;
 
-                                                if let Err(error) = result {
-                                                    warn!(%error, "Error sending keys to other devices");
-                                                }
+                                                    if let Err(error) = result {
+                                                        warn!(%error, "Error sending keys to other devices");
+                                                    }
+                                                });
                                             }
                                             RequestType::Blocked => {
                                                 warn!("storing blocked user is not implemented yet! we will not report blocked users to the device requesting the sync.");
-                                                let result = state.message_sender.send_sync_message(SyncMessage {
+                                                let mut message_sender =
+                                                    state.message_sender.clone();
+                                                tokio::task::spawn_local(async move {
+                                                    let result = message_sender.send_sync_message(SyncMessage {
                                                     blocked: Some(libsignal_service::content::sync_message::Blocked {
                                                         numbers: vec![],
                                                         acis: vec![],
@@ -699,9 +710,10 @@ impl<S: Store> Manager<S, Registered> {
                                                     ..SyncMessage::with_padding(&mut rand::rng())
                                                 }).await;
 
-                                                if let Err(error) = result {
-                                                    warn!(%error, "Error sending blocked contacts to other devices");
-                                                }
+                                                    if let Err(error) = result {
+                                                        warn!(%error, "Error sending blocked contacts to other devices");
+                                                    }
+                                                });
                                             }
                                             t => {
                                                 info!(type = ?t, "Got sync request of currently unhandled type")
@@ -876,10 +888,51 @@ impl<S: Store> Manager<S, Registered> {
         });
 
         Ok(Box::pin(
-            // we use the returning of the async closure in take_until as a stop signal
-            // if the future resolves *anything* the stream will end
+            // We use the returning of the async closure in take_until as a stop signal
+            // if the future resolves *anything* the stream will end.
             incoming_messages_stream.take_until(refresh_registration_task),
         ))
+    }
+
+    /// Uses Signal's SGX contact discovery service to resolve a phone number to its matching account identity
+    #[cfg(feature = "cdsi")]
+    pub async fn discover_contacts_by_phone_number<P: TryIntoE164>(
+        &mut self,
+        phone_numbers: impl IntoIterator<Item = P>,
+    ) -> Result<Vec<(PhoneNumber, Option<ServiceId>)>, Error<S::Error>> {
+        use libsignal_service::websocket::directory::LookupRequest;
+
+        let mut ws = self.identified_websocket(false).await?;
+
+        let lookup_request = LookupRequest {
+            new_e164s: phone_numbers
+                .into_iter()
+                .filter_map(|p| p.try_into_e164().ok())
+                .collect(),
+            ..Default::default()
+        };
+
+        Ok(ws
+            .discover_contacts(lookup_request)
+            .await?
+            .into_iter()
+            .map(|(e164, service_id)| {
+                use libsignal_service::utils::phonenumber_from_signal;
+                (phonenumber_from_signal(&e164), service_id)
+            })
+            .collect())
+    }
+
+    /// Resolves a username (which has a text part and an additional random number) to its account identity
+    /// for sending messages.
+    pub async fn lookup_username(
+        &mut self,
+        username: &str,
+    ) -> Result<Option<Aci>, Error<S::Error>> {
+        let username = Username::new(username)?;
+        let mut ws = self.unidentified_websocket().await?;
+        let resolved_username = ws.look_up_username(&username).await?;
+        Ok(resolved_username)
     }
 
     /// Sends a messages to the provided [ServiceId].
@@ -903,7 +956,7 @@ impl<S: Store> Manager<S, Registered> {
         //
         // Issue <https://github.com/whisperfish/presage/issues/252>
         let include_pni_signature = false;
-        let thread = Thread::Contact(recipient.raw_uuid());
+        let thread = Thread::Contact(recipient);
         let mut content_body: ContentBody = message.into();
 
         self.restore_thread_timer(&thread, &mut content_body).await;
@@ -1327,17 +1380,17 @@ impl<S: Store> Manager<S, Registered> {
     /// Returns the title of a thread (contact or group).
     pub async fn thread_title(&self, thread: &Thread) -> Result<String, Error<S::Error>> {
         match thread {
-            Thread::Contact(uuid) => {
-                let contact = match self.store.contact_by_id(uuid).await {
+            Thread::Contact(service_id) => {
+                let contact = match self.store.contact_by_id(service_id).await {
                     Ok(contact) => contact,
                     Err(error) => {
-                        info!(%error, %uuid, "error getting contact by id");
+                        info!(%error, service_id =% service_id.service_id_string(), "error getting contact by id");
                         None
                     }
                 };
                 Ok(match contact {
                     Some(contact) => contact.name,
-                    None => uuid.to_string(),
+                    None => service_id.service_id_string(),
                 })
             }
             Thread::Group(id) => match self.store.group(*id).await? {
@@ -1719,7 +1772,7 @@ async fn upsert_contact_from_profile<S: Store>(
     sender: ServiceId,
     profile_key: ProfileKey,
 ) -> Result<(), Error<<S as Store>::Error>> {
-    if store.contact_by_id(&sender.raw_uuid()).await?.is_none()
+    if store.contact_by_id(&sender).await?.is_none()
         || store
             .profile_key(&sender)
             .await?
@@ -1767,34 +1820,38 @@ async fn upsert_contact_from_profile<S: Store>(
 
 async fn set_account_attributes<S: Store>(
     account_manager: &mut AccountManager,
+    store: &S,
     data: &RegistrationData,
 ) -> Result<(), Error<S::Error>> {
     trace!("setting account attributes");
 
     let pni_registration_id = data.pni_registration_id.ok_or(Error::RelinkNecessary)?;
 
+    let name = if let Some(device_name) = data.device_name() {
+        let aci_key_pair = store.aci_protocol_store().get_identity_key_pair().await?;
+        let mut rng = rng();
+        Some(encrypt_device_name(
+            &mut rng,
+            device_name,
+            aci_key_pair.identity_key(),
+        )?)
+    } else {
+        None
+    };
+
     account_manager
         .set_account_attributes(AccountAttributes {
-            name: data.device_name().map(|d| d.to_string()),
+            fetches_messages: true,
             registration_id: data.registration_id,
             pni_registration_id,
-            signaling_key: None,
-            voice: false,
-            video: false,
-            fetches_messages: true,
-            pin: None,
+            name,
             registration_lock: None,
             unidentified_access_key: Some(data.profile_key.derive_access_key().to_vec()),
             unrestricted_unidentified_access: false,
+            capabilities: DeviceCapabilities::default(),
             discoverable_by_phone_number: true,
-            capabilities: DeviceCapabilities {
-                gift_badges: true,
-                payment_activation: false,
-                pni: true,
-                sender_key: true,
-                stories: false,
-                ..Default::default()
-            },
+            pin: None,
+            recovery_password: None,
         })
         .await?;
 

@@ -1,12 +1,13 @@
 use std::sync::Arc;
 
-use libsignal_service::configuration::{ServiceConfiguration, SignalServers};
+use libsignal_service::configuration::SignalServers;
 use libsignal_service::messagepipe::ServiceCredentials;
 use libsignal_service::prelude::phonenumber::PhoneNumber;
 use libsignal_service::prelude::PushService;
 use libsignal_service::protocol::IdentityKeyPair;
 use libsignal_service::provisioning::generate_registration_id;
 use libsignal_service::push_service::ServiceIds;
+use libsignal_service::utils::TryIntoE164;
 use libsignal_service::websocket::account::{AccountAttributes, DeviceCapabilities};
 use libsignal_service::websocket::registration::{RegistrationMethod, VerifyAccountResponse};
 use libsignal_service::zkgroup::profiles::ProfileKey;
@@ -58,15 +59,13 @@ impl<S: Store> Manager<S, Confirmation> {
         let credentials = ServiceCredentials {
             aci: None,
             pni: None,
-            phonenumber: self.state.phone_number.clone(),
-            password: Some(self.state.password.clone()),
-            signaling_key: None,
+            phonenumber: phone_number.try_into_e164().expect("valid phone number"),
+            password: Some(password.clone()),
             device_id: None,
         };
 
-        let service_configuration: ServiceConfiguration = signal_servers.into();
         let mut identified_push_service = PushService::new(
-            service_configuration,
+            *signal_servers,
             Some(credentials.clone()),
             crate::USER_AGENT,
         );
@@ -119,19 +118,17 @@ impl<S: Store> Manager<S, Confirmation> {
                 &mut rng,
                 RegistrationMethod::SessionId(&session.id),
                 AccountAttributes {
-                    signaling_key: Some(signaling_key.to_vec()),
+                    fetches_messages: true,
                     registration_id,
                     pni_registration_id,
-                    voice: false,
-                    video: false,
-                    fetches_messages: true,
-                    pin: None,
+                    name: None,
                     registration_lock: None,
                     unidentified_access_key: Some(profile_key.derive_access_key().to_vec()),
                     unrestricted_unidentified_access: false, // TODO: make this configurable?
-                    discoverable_by_phone_number: true,
-                    name: None,
                     capabilities: DeviceCapabilities::default(),
+                    discoverable_by_phone_number: true,
+                    pin: None,
+                    recovery_password: None,
                 },
                 &mut self.store.aci_protocol_store(),
                 &mut self.store.pni_protocol_store(),
@@ -147,7 +144,6 @@ impl<S: Store> Manager<S, Confirmation> {
                 phone_number: phone_number.clone(),
                 service_ids: ServiceIds { aci, pni },
                 password: password.clone(),
-                signaling_key,
                 device_id: None,
                 registration_id,
                 pni_registration_id: Some(pni_registration_id),
