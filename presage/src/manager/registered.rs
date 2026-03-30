@@ -450,39 +450,13 @@ impl<S: Store> Manager<S, Registered> {
             self.identified_websocket(false).await?,
             Some(self.state.data.profile_key),
         );
-
-        let registration_id = self.store.aci_protocol_store().get_local_registration_id().await?;
-        let pni_registration_id = self.store.pni_protocol_store().get_local_registration_id().await?;
-
-        let name = if let Some(device_name) = self.state.data.device_name() {
-            let aci_key_pair = self.store.aci_protocol_store().get_identity_key_pair().await?;
-            let mut rng = rand::rng();
-            Some(encrypt_device_name(
-                &mut rng,
-                device_name,
-                aci_key_pair.identity_key(),
-            )?)
-        } else {
-            None
-        };
-
-        account_manager
-            .set_account_attributes(AccountAttributes {
-                fetches_messages: true,
-                registration_id,
-                pni_registration_id,
-                name,
-                registration_lock: None, // Keep as None since we don't manage it yet
-                unidentified_access_key: Some(self.state.data.profile_key.derive_access_key().to_vec()),
-                unrestricted_unidentified_access: false,
-                capabilities: DeviceCapabilities::default(),
-                discoverable_by_phone_number: discoverable,
-                pin: None,
-                recovery_password: None,
-            })
-            .await?;
-
-        Ok(())
+        set_account_attributes(
+            &mut account_manager,
+            &self.store,
+            &self.state.data,
+            discoverable,
+        )
+        .await
     }
 
     pub async fn retrieve_group_avatar(
@@ -643,7 +617,7 @@ impl<S: Store> Manager<S, Registered> {
         // oneshot::channel() or CancellationToken because of !Send constraints in the Store.
         let refresh_registration_task = async move {
             if let Err(error) =
-                set_account_attributes(&mut account_manager, &store_inner, &registration_data_inner)
+                set_account_attributes(&mut account_manager, &store_inner, &registration_data_inner, true)
                     .await
             {
                 error!(%error, "failed to set account attributes, this is problematic and should never happen!");
@@ -1902,6 +1876,7 @@ async fn set_account_attributes<S: Store>(
     account_manager: &mut AccountManager,
     store: &S,
     data: &RegistrationData,
+    discoverable_by_phone_number: bool,
 ) -> Result<(), Error<S::Error>> {
     trace!("setting account attributes");
 
@@ -1929,7 +1904,7 @@ async fn set_account_attributes<S: Store>(
             unidentified_access_key: Some(data.profile_key.derive_access_key().to_vec()),
             unrestricted_unidentified_access: false,
             capabilities: DeviceCapabilities::default(),
-            discoverable_by_phone_number: true,
+            discoverable_by_phone_number,
             pin: None,
             recovery_password: None,
         })
