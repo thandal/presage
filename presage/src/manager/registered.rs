@@ -408,7 +408,7 @@ impl<S: Store> Manager<S, Registered> {
     /// Updates the user's profile information.
     pub async fn update_profile(
         &mut self,
-        name: &str,
+        name: libsignal_service::profile_name::ProfileName<String>,
         about: Option<String>,
         emoji: Option<String>,
     ) -> Result<(), Error<S::Error>> {
@@ -419,15 +419,10 @@ impl<S: Store> Manager<S, Registered> {
             Some(self.state.data.profile_key),
         );
 
-        let profile_name = libsignal_service::profile_name::ProfileName {
-            given_name: name.to_string(),
-            family_name: None,
-        };
-
         account_manager
             .upload_versioned_profile_without_avatar::<_, String>(
                 aci,
-                profile_name,
+                name,
                 about,
                 emoji,
                 true, // retain_avatar

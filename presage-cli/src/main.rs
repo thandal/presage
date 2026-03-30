@@ -133,8 +133,10 @@ enum Cmd {
     },
     #[clap(about = "Update the user's profile name and privacy settings")]
     UpdateProfile {
-        #[clap(long, help = "The display name of the profile")]
-        name: Option<String>,
+        #[clap(long, help = "The given (first) name of the profile")]
+        given_name: Option<String>,
+        #[clap(long, help = "The family (last) name of the profile")]
+        family_name: Option<String>,
         #[clap(long, help = "The 'about' text of the profile")]
         about: Option<String>,
         #[clap(long, help = "The 'emoji' of the profile")]
@@ -791,17 +793,22 @@ async fn run<S: Store>(subcommand: Cmd, store: S) -> anyhow::Result<()> {
             println!("{profile:#?}");
         }
         Cmd::UpdateProfile {
-            name,
+            given_name,
+            family_name,
             about,
             emoji,
             discoverable,
         } => {
             let mut manager = load_registered_and_receive(store).await?;
-            if let Some(name) = name {
-                manager.update_profile(&name, about, emoji).await?;
+            if let Some(given_name) = given_name {
+                let profile_name = presage::libsignal_service::profile_name::ProfileName {
+                    given_name,
+                    family_name,
+                };
+                manager.update_profile(profile_name, about, emoji).await?;
                 println!("Profile updated.");
-            } else if about.is_some() || emoji.is_some() {
-                bail!("The --name parameter is required when updating the profile fields (--about or --emoji)");
+            } else if family_name.is_some() || about.is_some() || emoji.is_some() {
+                bail!("The --given-name parameter is required when updating the profile fields (--family-name, --about or --emoji)");
             }
             if let Some(discoverable) = discoverable {
                 manager.set_phone_number_discoverability(discoverable).await?;
