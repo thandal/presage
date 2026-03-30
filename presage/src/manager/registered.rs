@@ -405,6 +405,91 @@ impl<S: Store> Manager<S, Registered> {
         Ok(profile)
     }
 
+    /// Updates the user's profile information.
+    pub async fn update_profile(
+        &mut self,
+        name: &str,
+        about: Option<String>,
+        emoji: Option<String>,
+    ) -> Result<(), Error<S::Error>> {
+        let aci = self.state.data.service_ids.aci();
+        let mut account_manager = AccountManager::new(
+            self.identified_push_service(),
+            self.identified_websocket(false).await?,
+            Some(self.state.data.profile_key),
+        );
+
+        let profile_name = libsignal_service::profile_name::ProfileName {
+            given_name: name.to_string(),
+            family_name: None,
+        };
+
+        account_manager
+            .upload_versioned_profile_without_avatar::<_, String>(
+                aci,
+                profile_name,
+                about,
+                emoji,
+                true, // retain_avatar
+                &mut rand::rng(),
+            )
+            .await?;
+
+        // Retrieve and save locally so we have the updated version
+        let profile = account_manager.retrieve_profile(aci).await?;
+        let _ = self
+            .store
+            .save_profile(aci.into(), self.state.data.profile_key, profile)
+            .await;
+
+        Ok(())
+    }
+
+    /// Updates the user's phone number discoverability privacy setting.
+    pub async fn set_phone_number_discoverability(
+        &mut self,
+        discoverable: bool,
+    ) -> Result<(), Error<S::Error>> {
+        let mut account_manager = AccountManager::new(
+            self.identified_push_service(),
+            self.identified_websocket(false).await?,
+            Some(self.state.data.profile_key),
+        );
+
+        let registration_id = self.store.aci_protocol_store().get_local_registration_id().await?;
+        let pni_registration_id = self.store.pni_protocol_store().get_local_registration_id().await?;
+
+        let name = if let Some(device_name) = self.state.data.device_name() {
+            let aci_key_pair = self.store.aci_protocol_store().get_identity_key_pair().await?;
+            let mut rng = rand::rng();
+            Some(encrypt_device_name(
+                &mut rng,
+                device_name,
+                aci_key_pair.identity_key(),
+            )?)
+        } else {
+            None
+        };
+
+        account_manager
+            .set_account_attributes(AccountAttributes {
+                fetches_messages: true,
+                registration_id,
+                pni_registration_id,
+                name,
+                registration_lock: None, // Keep as None since we don't manage it yet
+                unidentified_access_key: Some(self.state.data.profile_key.derive_access_key().to_vec()),
+                unrestricted_unidentified_access: false,
+                capabilities: DeviceCapabilities::default(),
+                discoverable_by_phone_number: discoverable,
+                pin: None,
+                recovery_password: None,
+            })
+            .await?;
+
+        Ok(())
+    }
+
     pub async fn retrieve_group_avatar(
         &mut self,
         context: GroupContextV2,

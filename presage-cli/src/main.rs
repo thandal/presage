@@ -131,6 +131,17 @@ enum Cmd {
         #[clap(long, value_parser = parse_base64_profile_key)]
         profile_key: Option<ProfileKey>,
     },
+    #[clap(about = "Update the user's profile name and privacy settings")]
+    UpdateProfile {
+        #[clap(long, help = "The display name of the profile")]
+        name: Option<String>,
+        #[clap(long, help = "The 'about' text of the profile")]
+        about: Option<String>,
+        #[clap(long, help = "The 'emoji' of the profile")]
+        emoji: Option<String>,
+        #[clap(long, help = "Whether the phone number should be discoverable (true/false)")]
+        discoverable: Option<bool>,
+    },
     #[clap(about = "Receive all pending messages and saves them to disk")]
     Sync {
         #[clap(long = "notifications", short = 'n')]
@@ -778,6 +789,24 @@ async fn run<S: Store>(subcommand: Cmd, store: S) -> anyhow::Result<()> {
                 Some(profile_key) => manager.retrieve_profile_by_uuid(uuid, profile_key).await?,
             };
             println!("{profile:#?}");
+        }
+        Cmd::UpdateProfile {
+            name,
+            about,
+            emoji,
+            discoverable,
+        } => {
+            let mut manager = load_registered_and_receive(store).await?;
+            if let Some(name) = name {
+                manager.update_profile(&name, about, emoji).await?;
+                println!("Profile updated.");
+            } else if about.is_some() || emoji.is_some() {
+                bail!("The --name parameter is required when updating the profile fields (--about or --emoji)");
+            }
+            if let Some(discoverable) = discoverable {
+                manager.set_phone_number_discoverability(discoverable).await?;
+                println!("Phone number discoverability updated locally and on the server.");
+            }
         }
         Cmd::ListGroups {
             name_filter,
