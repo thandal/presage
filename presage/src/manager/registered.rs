@@ -440,25 +440,6 @@ impl<S: Store> Manager<S, Registered> {
         Ok(())
     }
 
-    /// Updates the user's phone number discoverability privacy setting.
-    pub async fn set_phone_number_discoverability(
-        &mut self,
-        discoverable: bool,
-    ) -> Result<(), Error<S::Error>> {
-        let mut account_manager = AccountManager::new(
-            self.identified_push_service(),
-            self.identified_websocket(false).await?,
-            Some(self.state.data.profile_key),
-        );
-        set_account_attributes(
-            &mut account_manager,
-            &self.store,
-            &self.state.data,
-            discoverable,
-        )
-        .await
-    }
-
     pub async fn retrieve_group_avatar(
         &mut self,
         context: GroupContextV2,
@@ -617,7 +598,7 @@ impl<S: Store> Manager<S, Registered> {
         // oneshot::channel() or CancellationToken because of !Send constraints in the Store.
         let refresh_registration_task = async move {
             if let Err(error) =
-                set_account_attributes(&mut account_manager, &store_inner, &registration_data_inner, true)
+                set_account_attributes(&mut account_manager, &store_inner, &registration_data_inner)
                     .await
             {
                 error!(%error, "failed to set account attributes, this is problematic and should never happen!");
@@ -1876,7 +1857,6 @@ async fn set_account_attributes<S: Store>(
     account_manager: &mut AccountManager,
     store: &S,
     data: &RegistrationData,
-    discoverable_by_phone_number: bool,
 ) -> Result<(), Error<S::Error>> {
     trace!("setting account attributes");
 
@@ -1904,7 +1884,7 @@ async fn set_account_attributes<S: Store>(
             unidentified_access_key: Some(data.profile_key.derive_access_key().to_vec()),
             unrestricted_unidentified_access: false,
             capabilities: DeviceCapabilities::default(),
-            discoverable_by_phone_number,
+            discoverable_by_phone_number: true,
             pin: None,
             recovery_password: None,
         })

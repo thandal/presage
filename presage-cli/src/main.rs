@@ -141,8 +141,6 @@ enum Cmd {
         about: Option<String>,
         #[clap(long, help = "The 'emoji' of the profile")]
         emoji: Option<String>,
-        #[clap(long, help = "Whether the phone number should be discoverable (true/false)")]
-        discoverable: Option<bool>,
     },
     #[clap(about = "Receive all pending messages and saves them to disk")]
     Sync {
@@ -797,7 +795,6 @@ async fn run<S: Store>(subcommand: Cmd, store: S) -> anyhow::Result<()> {
             family_name,
             about,
             emoji,
-            discoverable,
         } => {
             let mut manager = load_registered_and_receive(store).await?;
             if let Some(given_name) = given_name {
@@ -809,10 +806,6 @@ async fn run<S: Store>(subcommand: Cmd, store: S) -> anyhow::Result<()> {
                 println!("Profile updated.");
             } else if family_name.is_some() || about.is_some() || emoji.is_some() {
                 bail!("The --given-name parameter is required when updating the profile fields (--family-name, --about or --emoji)");
-            }
-            if let Some(discoverable) = discoverable {
-                manager.set_phone_number_discoverability(discoverable).await?;
-                println!("Phone number discoverability updated locally and on the server.");
             }
         }
         Cmd::ListGroups {
