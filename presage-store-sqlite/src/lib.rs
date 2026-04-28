@@ -85,8 +85,14 @@ impl SqliteStore {
         options: SqliteConnectOptions,
         trust_new_identities: OnNewIdentity,
     ) -> Result<Self, SqliteStoreError> {
+        // We use `Delete` (rollback-journal) rather than WAL because the
+        // hotline persistence layer ships only the main `.db` file to Twilio
+        // Sync; with WAL, un-checkpointed writes live in a `-wal` sidecar that
+        // we don't preserve, so any crash or process exit before checkpoint
+        // produces a "malformed" image on the next download. Rollback journal
+        // keeps the main file authoritative on every commit.
         let options = options
-            .journal_mode(SqliteJournalMode::Wal)
+            .journal_mode(SqliteJournalMode::Delete)
             .synchronous(SqliteSynchronous::Full);
         let db = SqlitePool::connect_with(options).await?;
 
@@ -112,11 +118,49 @@ impl SqliteStore {
                 .await?;
         }
 
-        sqlx::migrate!().run(&db).await?;
+        // Tolerate DBs that were last migrated by a fork or future build of
+        // presage-store-sqlite carrying migrations we don't ship. Without
+        // ignore_missing, sqlx refuses to open the DB at all.
+        let mut migrator = sqlx::migrate!();
+        migrator.set_ignore_missing(true);
+        migrator.run(&db).await?;
         Ok(Self {
             db,
             trust_new_identities,
         })
+    }
+
+    /// Deletes rows from cache-only tables and VACUUMs the database, shrinking it to the
+    /// minimum state needed to keep writing to existing conversations. Intended for operators
+    /// who want to run a send-only client on storage-constrained backends.
+    ///
+    /// Preserves: kv, sessions, identities, pre_keys, signed_pre_keys, kyber_pre_keys,
+    /// sender_keys, profile_keys, profiles, groups, contacts (rows and profile keys, but
+    /// the avatar BLOB is cleared).
+    ///
+    /// Removes: profile_avatars, group_avatars, thread_messages, threads, sticker_packs,
+    /// contacts_verification_state, plus contacts.avatar BLOBs.
+    pub async fn prune_cache(&self) -> Result<(), SqliteStoreError> {
+        let mut tx = self.db.begin().await?;
+        for stmt in [
+            "DELETE FROM profile_avatars",
+            "DELETE FROM group_avatars",
+            "DELETE FROM thread_messages",
+            "DELETE FROM threads",
+            "DELETE FROM sticker_packs",
+            "DELETE FROM contacts_verification_state",
+            "UPDATE contacts SET avatar = NULL",
+        ] {
+            sqlx::query(stmt).execute(&mut *tx).await?;
+        }
+        tx.commit().await?;
+
+        // VACUUM cannot run inside a transaction and reclaims the space freed above.
+        sqlx::query("VACUUM").execute(&self.db).await?;
+        // Fold the WAL into the main DB file and truncate it, so callers that read the
+        // raw `.db` file (to ship it elsewhere) see the full state.
+        sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)").execute(&self.db).await?;
+        Ok(())
     }
 
     /// There sadly does not seem to be a good migration strategy contained within the database we are trying to migrate.

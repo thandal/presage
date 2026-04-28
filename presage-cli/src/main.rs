@@ -11,6 +11,7 @@ use directories::ProjectDirs;
 use futures::StreamExt;
 use futures::{channel::oneshot, future, pin_mut};
 use mime_guess::mime::APPLICATION_OCTET_STREAM;
+// desktop notifications dropped to keep binary size under the 10 MB serverless budget
 // use notify_rust::Notification;
 use presage::libsignal_service::configuration::SignalServers;
 use presage::libsignal_service::content::Reaction;
@@ -89,45 +90,36 @@ enum Cmd {
         #[clap(long, help = "Force to register again if already registered")]
         force: bool,
     },
+    #[cfg(feature = "extras")]
     #[clap(about = "Create QR code (URL) and wait until this device is linked as new secondary")]
     LinkDevice {
-        /// Possible values: staging, production
         #[clap(long, short = 's', default_value = "production")]
         servers: SignalServers,
-        #[clap(
-            long,
-            short = 'n',
-            help = "Name of the device to register in the primary client"
-        )]
+        #[clap(long, short = 'n')]
         device_name: String,
     },
-    #[clap(
-        about = "Add a new secondary device to this (primary) device via URL (see link-device)"
-    )]
+    #[cfg(feature = "extras")]
+    #[clap(about = "Add a new secondary device via URL")]
     AddDevice {
-        #[clap(
-            long,
-            short = 'u',
-            help = "The URL (that is represented as QR code) created by the secondary device (see link-device)"
-        )]
+        #[clap(long, short = 'u')]
         url: Url,
     },
+    #[cfg(feature = "extras")]
     #[clap(about = "Unlink device by device id")]
     UnlinkDevice {
-        #[clap(long, short = 'd', help = "Device id")]
+        #[clap(long, short = 'd')]
         device_id: u32,
     },
+    #[cfg(feature = "extras")]
     #[clap(about = "List all linked devices")]
     ListDevices,
     #[clap(about = "Get information on the registered user")]
     Whoami,
-    #[clap(about = "Retrieve the user profile")]
+    #[cfg(feature = "extras")]
+    #[clap(about = "Retrieve a user profile by UUID")]
     RetrieveProfile {
-        /// Id of the user to retrieve the profile. When omitted, retrieves the registered user
-        /// profile.
         #[clap(long)]
         uuid: Uuid,
-        /// Base64-encoded profile key of user to be able to access their profile
         #[clap(long, value_parser = parse_base64_profile_key)]
         profile_key: Option<ProfileKey>,
     },
@@ -141,6 +133,11 @@ enum Cmd {
             help = "Exit after processing the messages in the queue (similar to the syncing of Signal Desktop)"
         )]
         stop_after_empty_queue: bool,
+        #[clap(
+            long,
+            help = "Auto-reply to every incoming 1:1 text message with this body"
+        )]
+        auto_reply: Option<String>,
     },
     #[clap(about = "List groups")]
     ListGroups {
@@ -151,8 +148,10 @@ enum Cmd {
         #[clap(long, short = 'v')]
         verbose: bool,
     },
+    #[cfg(feature = "extras")]
     #[clap(about = "List contacts")]
     ListContacts,
+    #[cfg(feature = "extras")]
     #[clap(
         about = "List messages",
         group(
@@ -162,41 +161,40 @@ enum Cmd {
         )
     )]
     ListMessages {
-        #[clap(long, short = 'u', help = "recipient service ID (no prefix defaults to ACI, otherwise PNI:[uuid])", value_parser = parse_service_id)]
+        #[clap(long, short = 'u', value_parser = parse_service_id)]
         recipient_service_id: Option<ServiceId>,
-        #[clap(
-            long,
-            short = 'k',
-            help = "Master Key of the V2 group (hex string)",
-            value_parser = parse_group_master_key,
-        )]
+        #[clap(long, short = 'k', value_parser = parse_group_master_key)]
         group_master_key: Option<GroupMasterKeyBytes>,
-        #[clap(long, help = "start from the following date (UNIX timestamp)")]
+        #[clap(long)]
         from: Option<u64>,
     },
+    #[cfg(feature = "extras")]
     #[clap(about = "List downloaded sticker packs")]
     ListStickerPacks,
+    #[cfg(feature = "extras")]
     #[clap(about = "Get a single contact by service ID")]
     GetContact {
         #[clap(long, value_parser = parse_service_id)]
         id: ServiceId,
     },
+    #[cfg(feature = "extras")]
     #[clap(about = "Find a contact in the embedded DB")]
     FindContact {
-        #[clap(long, short = 'u', help = "contact service ID", value_parser = parse_service_id)]
+        #[clap(long, short = 'u', value_parser = parse_service_id)]
         id: Option<ServiceId>,
-        #[clap(long, short = 'p', help = "contact phone number")]
+        #[clap(long, short = 'p')]
         phone_number: Option<PhoneNumber>,
-        #[clap(long, short = 'n', help = "contact name")]
+        #[clap(long, short = 'n')]
         name: Option<String>,
     },
-    #[clap(about = "Send a message")]
+    #[cfg(feature = "extras")]
+    #[clap(about = "Send a message to a UUID")]
     Send {
-        #[clap(long, short = 'u', help = "uuid of the recipient")]
+        #[clap(long, short = 'u')]
         uuid: Uuid,
-        #[clap(long, short = 'm', help = "Contents of the message to send")]
+        #[clap(long, short = 'm')]
         message: String,
-        #[clap(long = "attach", help = "Path to a file to attach, can be repeated")]
+        #[clap(long = "attach")]
         attachment_filepath: Vec<PathBuf>,
     },
     #[clap(about = "Send a message to group")]
@@ -208,21 +206,39 @@ enum Cmd {
         #[clap(long = "attach", help = "Path to a file to attach, can be repeated")]
         attachment_filepath: Vec<PathBuf>,
     },
+    #[cfg(feature = "extras")]
     SyncContacts,
-    #[clap(
-        about = "Resolves one or multiple phone numbers to their possible account identity identifier"
-    )]
-    #[cfg(feature = "cdsi")]
+    #[cfg(all(feature = "cdsi", feature = "extras"))]
+    #[clap(about = "Resolves phone numbers to their account identity identifier")]
     ResolvePhoneNumber {
         #[clap(long, short = 'p')]
         phone_number: Vec<PhoneNumber>,
     },
+    #[cfg(feature = "extras")]
     LookupUsername {
         #[clap(long, short = 'u')]
         username: String,
     },
+    #[clap(about = "Retrieve own profile (name/about/emoji) and print as JSON")]
+    RetrieveProfileSelf,
+    #[clap(about = "Update the user's profile display name, about text, and emoji")]
+    UpdateProfile {
+        #[clap(long, help = "The given (first) name of the profile")]
+        given_name: Option<String>,
+        #[clap(long, help = "The family (last) name of the profile")]
+        family_name: Option<String>,
+        #[clap(long, help = "The 'about' text of the profile")]
+        about: Option<String>,
+        #[clap(long, help = "The 'emoji' of the profile")]
+        emoji: Option<String>,
+    },
+    #[cfg(feature = "extras")]
     #[clap(about = "Print various statistics useful for debugging")]
     Stats,
+    #[clap(
+        about = "Delete cache-only rows (avatars, received messages, sticker packs, ...) and VACUUM the database"
+    )]
+    PruneCache,
 }
 
 enum Recipient {
@@ -255,13 +271,10 @@ fn ensure_parent_dir_exists(path: &str) -> anyhow::Result<()> {
 }
 
 fn init() -> Args {
-    let filter = tracing_subscriber::EnvFilter::builder()
-        .with_default_directive(tracing::metadata::LevelFilter::INFO.into())
-        .from_env_lossy()
-        .add_directive("libsignal=error".parse().unwrap());
+    // Plain INFO-level subscriber; env-filter dropped to keep the binary small.
     tracing_subscriber::fmt::fmt()
         .with_writer(std::io::stderr)
-        .with_env_filter(filter)
+        .with_max_level(tracing::Level::INFO)
         .init();
     Args::parse()
 }
@@ -287,6 +300,14 @@ async fn main() -> anyhow::Result<()> {
         OnNewIdentity::Trust,
     )
     .await?;
+
+    if matches!(args.subcommand, Cmd::PruneCache) {
+        let before = std::fs::metadata(&sqlite_db_path).map(|m| m.len()).unwrap_or(0);
+        config_store.prune_cache().await?;
+        let after = std::fs::metadata(&sqlite_db_path).map(|m| m.len()).unwrap_or(0);
+        println!("pruned: {before} -> {after} bytes");
+        return Ok(());
+    }
 
     let local = tokio::task::LocalSet::new();
     local.run_until(run(args.subcommand, config_store)).await
@@ -577,6 +598,7 @@ async fn receive<S: Store>(
     mut manager: Manager<S, Registered>,
     notifications: bool,
     stop_after_empty_queue: bool,
+    auto_reply: Option<String>,
 ) -> anyhow::Result<()> {
     let attachments_tmp_dir = attachments_tmp_dir()?;
     let messages = manager
@@ -601,7 +623,36 @@ async fn receive<S: Store>(
                     notifications,
                     &content,
                 )
-                .await
+                .await;
+
+                // Auto-reply: respond to every plain 1:1 text message with the
+                // configured body. Replies go back to the sender's ServiceId,
+                // which we already have from the envelope — no phone-number
+                // lookup or CDSI required. We deliberately ignore reactions,
+                // edits, sync messages, receipts, and group messages.
+                if let Some(reply_text) = auto_reply.as_deref() {
+                    if let ContentBody::DataMessage(dm) = &content.body {
+                        if dm.group_v2.is_none() && dm.body.is_some() {
+                            let recipient = content.metadata.sender;
+                            let timestamp = std::time::SystemTime::now()
+                                .duration_since(UNIX_EPOCH)
+                                .expect("Time went backwards")
+                                .as_millis() as u64;
+                            let reply = DataMessage {
+                                body: Some(reply_text.to_string()),
+                                timestamp: Some(timestamp),
+                                ..Default::default()
+                            };
+                            info!(recipient = %recipient.service_id_string(), "sending auto-reply");
+                            if let Err(error) = manager
+                                .send_message(recipient, reply, timestamp)
+                                .await
+                            {
+                                warn!(%error, "auto-reply send failed");
+                            }
+                        }
+                    }
+                }
             }
         }
     }
@@ -643,6 +694,7 @@ async fn run<S: Store>(subcommand: Cmd, store: S) -> anyhow::Result<()> {
                 );
             }
         }
+        #[cfg(feature = "extras")]
         Cmd::LinkDevice {
             servers,
             device_name,
@@ -681,20 +733,24 @@ async fn run<S: Store>(subcommand: Cmd, store: S) -> anyhow::Result<()> {
         Cmd::Sync {
             notifications,
             stop_after_empty_queue,
+            auto_reply,
         } => {
             let manager = Manager::load_registered(store).await?;
-            receive(manager, notifications, stop_after_empty_queue).await?;
+            receive(manager, notifications, stop_after_empty_queue, auto_reply).await?;
         }
+        #[cfg(feature = "extras")]
         Cmd::AddDevice { url } => {
             let mut manager = load_registered_and_receive(store).await?;
             manager.link_secondary(url).await?;
             println!("Added new secondary device");
         }
+        #[cfg(feature = "extras")]
         Cmd::UnlinkDevice { device_id } => {
             let manager = load_registered_and_receive(store).await?;
             manager.unlink_secondary(device_id).await?;
             println!("Unlinked device with id: {}", device_id);
         }
+        #[cfg(feature = "extras")]
         Cmd::ListDevices => {
             let manager = load_registered_and_receive(store).await?;
             let devices = manager.devices().await?;
@@ -716,6 +772,7 @@ async fn run<S: Store>(subcommand: Cmd, store: S) -> anyhow::Result<()> {
                 );
             }
         }
+        #[cfg(feature = "extras")]
         Cmd::Send {
             uuid,
             message,
@@ -751,6 +808,7 @@ async fn run<S: Store>(subcommand: Cmd, store: S) -> anyhow::Result<()> {
 
             send(&mut manager, Recipient::Group(master_key), data_message).await?;
         }
+        #[cfg(feature = "extras")]
         Cmd::RetrieveProfile {
             uuid,
             mut profile_key,
@@ -778,6 +836,40 @@ async fn run<S: Store>(subcommand: Cmd, store: S) -> anyhow::Result<()> {
                 Some(profile_key) => manager.retrieve_profile_by_uuid(uuid, profile_key).await?,
             };
             println!("{profile:#?}");
+        }
+        Cmd::RetrieveProfileSelf => {
+            let mut manager = load_registered_and_receive(store).await?;
+            let profile = manager.retrieve_profile().await?;
+            let (given_name, family_name) = match profile.name {
+                Some(n) => (Some(n.given_name), n.family_name),
+                None => (None, None),
+            };
+            let out = serde_json::json!({
+                "given_name": given_name,
+                "family_name": family_name,
+                "about": profile.about,
+                "about_emoji": profile.about_emoji,
+                "avatar": profile.avatar,
+            });
+            println!("{}", out);
+        }
+        Cmd::UpdateProfile {
+            given_name,
+            family_name,
+            about,
+            emoji,
+        } => {
+            let mut manager = load_registered_and_receive(store).await?;
+            if let Some(given_name) = given_name {
+                let profile_name = presage::libsignal_service::profile_name::ProfileName {
+                    given_name,
+                    family_name,
+                };
+                manager.update_profile(profile_name, about, emoji).await?;
+                println!("Profile updated.");
+            } else if family_name.is_some() || about.is_some() || emoji.is_some() {
+                bail!("The --given-name parameter is required when updating the profile fields (--family-name, --about or --emoji)");
+            }
         }
         Cmd::ListGroups {
             name_filter,
@@ -833,6 +925,7 @@ async fn run<S: Store>(subcommand: Cmd, store: S) -> anyhow::Result<()> {
                 };
             }
         }
+        #[cfg(feature = "extras")]
         Cmd::ListContacts => {
             let manager = load_registered_and_receive(store).await?;
             for Contact {
@@ -845,6 +938,7 @@ async fn run<S: Store>(subcommand: Cmd, store: S) -> anyhow::Result<()> {
                 println!("{uuid} / {phone_number:?} / {name}");
             }
         }
+        #[cfg(feature = "extras")]
         Cmd::ListStickerPacks => {
             let manager = load_registered_and_receive(store).await?;
             for sticker_pack in manager.store().sticker_packs().await? {
@@ -874,6 +968,7 @@ async fn run<S: Store>(subcommand: Cmd, store: S) -> anyhow::Result<()> {
             let manager = load_registered_and_receive(store).await?;
             println!("{:?}", &manager.whoami().await?);
         }
+        #[cfg(feature = "extras")]
         Cmd::GetContact { ref id } => {
             let manager = load_registered_and_receive(store).await?;
             match manager.store().contact_by_id(id).await? {
@@ -881,6 +976,7 @@ async fn run<S: Store>(subcommand: Cmd, store: S) -> anyhow::Result<()> {
                 None => eprintln!("Could not find contact for {}", id.service_id_string()),
             }
         }
+        #[cfg(feature = "extras")]
         Cmd::FindContact {
             id,
             phone_number,
@@ -899,6 +995,7 @@ async fn run<S: Store>(subcommand: Cmd, store: S) -> anyhow::Result<()> {
                 println!("{contact:#?}");
             }
         }
+        #[cfg(feature = "extras")]
         Cmd::SyncContacts => {
             let mut manager = load_registered_and_receive(store).await?;
             manager.request_contacts().await?;
@@ -919,6 +1016,7 @@ async fn run<S: Store>(subcommand: Cmd, store: S) -> anyhow::Result<()> {
                 }
             }
         }
+        #[cfg(feature = "extras")]
         Cmd::ListMessages {
             group_master_key,
             recipient_service_id,
@@ -939,7 +1037,7 @@ async fn run<S: Store>(subcommand: Cmd, store: S) -> anyhow::Result<()> {
                 print_message(&manager, false, &msg).await;
             }
         }
-        #[cfg(feature = "cdsi")]
+        #[cfg(all(feature = "cdsi", feature = "extras"))]
         Cmd::ResolvePhoneNumber { phone_number } => {
             let mut manager = load_registered_and_receive(store).await?;
             let resolved_account_identities = manager
@@ -954,6 +1052,7 @@ async fn run<S: Store>(subcommand: Cmd, store: S) -> anyhow::Result<()> {
                 }
             }
         }
+        #[cfg(feature = "extras")]
         Cmd::LookupUsername { username } => {
             let mut manager = load_registered_and_receive(store).await?;
             let resolved_service_id = manager.lookup_username(&username).await?;
@@ -962,6 +1061,7 @@ async fn run<S: Store>(subcommand: Cmd, store: S) -> anyhow::Result<()> {
                 None => println!("{username} => no matching account found"),
             }
         }
+        #[cfg(feature = "extras")]
         Cmd::Stats => {
             let manager = load_registered_and_receive(store).await?;
 
@@ -1010,6 +1110,9 @@ async fn run<S: Store>(subcommand: Cmd, store: S) -> anyhow::Result<()> {
 
             println!("{stats:#?}")
         }
+        Cmd::PruneCache => {
+            unreachable!("prune-cache is dispatched in main() before run()")
+        }
     }
     Ok(())
 }
@@ -1019,7 +1122,7 @@ async fn load_registered_and_receive<S: Store + Send>(
 ) -> anyhow::Result<Manager<S, Registered>> {
     let manager = Manager::load_registered(store).await?;
     let manager_receive = manager.clone();
-    tokio::task::spawn_local(receive(manager_receive, false, false));
+    tokio::task::spawn_local(receive(manager_receive, false, false, None));
     Ok(manager)
 }
 

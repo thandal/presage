@@ -20,7 +20,8 @@ use libsignal_service::{
         Verified,
     },
     protocol::{
-        Aci, DeviceId, IdentityKeyStore, SenderCertificate, ServiceId, ServiceIdKind, Username,
+        Aci, CiphertextMessageType, DecryptionErrorMessage, DeviceId, IdentityKeyStore,
+        PlaintextContent, SenderCertificate, ServiceId, ServiceIdKind, Timestamp, Username,
     },
     provisioning::ProvisioningError,
     push_service::{PushService, ServiceIds, DEFAULT_DEVICE_ID},
@@ -405,6 +406,43 @@ impl<S: Store> Manager<S, Registered> {
         Ok(profile)
     }
 
+    /// Updates the user's profile (display name, about text, emoji). Used for
+    /// setting the display name of a send-only bot. Ported from the upstream
+    /// `UpdateProfile` branch in presage.
+    pub async fn update_profile(
+        &mut self,
+        name: libsignal_service::profile_name::ProfileName<String>,
+        about: Option<String>,
+        emoji: Option<String>,
+    ) -> Result<(), Error<S::Error>> {
+        let aci = self.state.data.service_ids.aci();
+        let mut account_manager = AccountManager::new(
+            self.identified_push_service(),
+            self.identified_websocket(false).await?,
+            Some(self.state.data.profile_key),
+        );
+
+        account_manager
+            .upload_versioned_profile_without_avatar::<_, String>(
+                aci,
+                name,
+                about,
+                emoji,
+                true, // retain_avatar
+                &mut rand::rng(),
+            )
+            .await?;
+
+        // Refetch and persist so the local DB has the updated display name.
+        let profile = account_manager.retrieve_profile(aci).await?;
+        let _ = self
+            .store
+            .save_profile(aci.into(), self.state.data.profile_key, profile)
+            .await;
+
+        Ok(())
+    }
+
     pub async fn retrieve_group_avatar(
         &mut self,
         context: GroupContextV2,
@@ -600,6 +638,22 @@ impl<S: Store> Manager<S, Registered> {
                 loop {
                     match state.encrypted_messages.next().await {
                         Some(Ok(Incoming::Envelope(envelope))) => {
+                            // Snapshot fields we'd need to send a DecryptionErrorMessage
+                            // on decrypt failure. `open_envelope` consumes the envelope,
+                            // so we grab these up front. This is the retry-receipt bridge
+                            // that unsticks a user whose Signal client has a stale session
+                            // with us: we send the DEM back carrying the ratchet key from
+                            // the failed ciphertext, and the recipient's client archives
+                            // its session and re-handshakes via a prekey message.
+                            let retry_source = envelope
+                                .source_service_id
+                                .as_deref()
+                                .and_then(ServiceId::parse_from_service_id_string);
+                            let retry_device = envelope.source_device();
+                            let retry_envelope_type = envelope.r#type();
+                            let retry_ciphertext = envelope.content.clone();
+                            let retry_timestamp = envelope.timestamp();
+
                             let envelope = {
                                 // the permit is released at the end of the block (impl Drop)
                                 match ServiceId::parse_from_service_id_string(
@@ -871,6 +925,72 @@ impl<S: Store> Manager<S, Registered> {
                                 }
                                 Err(error) => {
                                     error!(%error, "error opening envelope, message will be skipped!");
+                                    // Build the DEM target: (sender, device, inner msg type,
+                                    // inner ciphertext). For non-sealed envelopes the source +
+                                    // wrapper ciphertext are already what we need. For sealed
+                                    // sender the outer envelope intentionally hides the sender,
+                                    // so peek the sealed wrapper to extract the sender cert and
+                                    // inner ciphertext.
+                                    use libsignal_service::proto::envelope::Type as EnvelopeType;
+                                    let dem_target: Option<(ServiceId, u32, CiphertextMessageType, Vec<u8>)> =
+                                        if retry_envelope_type == EnvelopeType::UnidentifiedSender {
+                                            match retry_ciphertext.as_ref() {
+                                                Some(ct) => match state
+                                                    .service_cipher_aci
+                                                    .peek_unidentified_sender(ct)
+                                                    .await
+                                                {
+                                                    Ok((sender, dev, mt, inner)) => {
+                                                        Some((sender, u32::from(dev), mt, inner))
+                                                    }
+                                                    Err(e) => {
+                                                        warn!(error = %e, "failed to peek sealed sender wrapper for DEM target");
+                                                        None
+                                                    }
+                                                },
+                                                None => None,
+                                            }
+                                        } else {
+                                            let mt = match retry_envelope_type {
+                                                EnvelopeType::Ciphertext => Some(CiphertextMessageType::Whisper),
+                                                EnvelopeType::PrekeyBundle => Some(CiphertextMessageType::PreKey),
+                                                EnvelopeType::SenderkeyMessage => Some(CiphertextMessageType::SenderKey),
+                                                _ => None,
+                                            };
+                                            match (retry_source, retry_ciphertext.clone(), mt) {
+                                                (Some(s), Some(ct), Some(t)) => Some((s, retry_device, t, ct)),
+                                                _ => None,
+                                            }
+                                        };
+
+                                    if let Some((source, device, msg_type, ciphertext)) = dem_target {
+                                        if let Err(e) = try_send_retry_receipt::<S>(
+                                            &mut state.message_sender,
+                                            source,
+                                            device,
+                                            msg_type,
+                                            &ciphertext,
+                                            retry_timestamp,
+                                        )
+                                        .await
+                                        {
+                                            warn!(
+                                                error = %e,
+                                                "failed to send DecryptionErrorMessage retry receipt"
+                                            );
+                                        } else {
+                                            info!(
+                                                "sent DecryptionErrorMessage to {} device {}",
+                                                source.service_id_string(),
+                                                device
+                                            );
+                                        }
+                                    } else {
+                                        debug!(
+                                            ?retry_envelope_type,
+                                            "skipping DEM: no sender available"
+                                        );
+                                    }
                                 }
                             }
                         }
@@ -1608,6 +1728,49 @@ async fn download_sticker<C: ContentsStore>(
 /// Save a message into the store.
 /// Note that `override_thread` can be used to specify the thread the message will be stored in.
 /// This is required when storing outgoing messages, as in this case the appropriate storage place cannot be derived from the message itself.
+/// On decrypt failure, construct a `DecryptionErrorMessage` from the original
+/// ciphertext and send it back to the sender as a PLAINTEXT_CONTENT envelope.
+/// The recipient's Signal client — seeing a retry receipt whose ratchet key
+/// matches their current session with us — will archive that session and
+/// re-handshake via a prekey message. That's the unstick for a user whose
+/// client has a stale session from our prior (pre-re-register) identity.
+///
+/// `ciphertext` must be the *inner* Whisper/PreKey/SenderKey bytes (i.e. for
+/// sealed-sender envelopes, the contents extracted via the unidentified-sender
+/// unwrap, not the outer sealed wrapper). SenderKey messages don't carry a
+/// ratchet key, so the receiving side's session archival logic won't fire —
+/// we send the DEM anyway for group-resend handling.
+async fn try_send_retry_receipt<S: Store>(
+    message_sender: &mut MessageSender<S::AciStore>,
+    source: ServiceId,
+    source_device: u32,
+    msg_type: CiphertextMessageType,
+    ciphertext: &[u8],
+    timestamp: u64,
+) -> Result<(), libsignal_service::prelude::MessageSenderError> {
+    let dem = DecryptionErrorMessage::for_original(
+        ciphertext,
+        msg_type,
+        Timestamp::from_epoch_millis(timestamp),
+        source_device,
+    )
+    .map_err(libsignal_service::prelude::MessageSenderError::from)?;
+
+    let plaintext: PlaintextContent = dem.into();
+    let device_id: DeviceId = source_device
+        .try_into()
+        .map_err(libsignal_service::prelude::MessageSenderError::from)?;
+
+    let now = std::time::SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(timestamp);
+
+    message_sender
+        .send_plaintext_content(&source, device_id, plaintext.serialized(), now)
+        .await
+}
+
 async fn save_message<S: Store>(
     store: &mut S,
     identified_websocket: &mut websocket::SignalWebSocket<websocket::Identified>,
