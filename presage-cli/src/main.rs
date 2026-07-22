@@ -223,6 +223,10 @@ enum Cmd {
     },
     #[clap(about = "Print various statistics useful for debugging")]
     Stats,
+    #[clap(
+        about = "Delete cache-only rows (avatars, received messages, sticker packs, ...) and VACUUM the database"
+    )]
+    PruneCache,
 }
 
 enum Recipient {
@@ -287,6 +291,16 @@ async fn main() -> anyhow::Result<()> {
         OnNewIdentity::Trust,
     )
     .await?;
+
+    // PruneCache needs SqliteStore-specific access, so handle it directly here
+    // rather than through the generic run() function.
+    if matches!(args.subcommand, Cmd::PruneCache) {
+        let before = std::fs::metadata(&sqlite_db_path).map(|m| m.len()).unwrap_or(0);
+        config_store.prune_cache().await?;
+        let after = std::fs::metadata(&sqlite_db_path).map(|m| m.len()).unwrap_or(0);
+        println!("pruned: {before} -> {after} bytes");
+        return Ok(());
+    }
 
     let local = tokio::task::LocalSet::new();
     local.run_until(run(args.subcommand, config_store)).await
@@ -1009,6 +1023,10 @@ async fn run<S: Store>(subcommand: Cmd, store: S) -> anyhow::Result<()> {
             };
 
             println!("{stats:#?}")
+        }
+        Cmd::PruneCache => {
+            // Handled in main() with direct SqliteStore access; unreachable here.
+            unreachable!("prune-cache is dispatched in main() before run()")
         }
     }
     Ok(())
