@@ -419,8 +419,23 @@ impl ContentsStore for SqliteStore {
     ) -> Result<(), Self::ContentsStoreError> {
         let g = SqlGroup::from_group(&master_key, group.into());
         let master_key = g.master_key.as_ref();
+        // Name the columns explicitly so the INSERT works against DBs whose
+        // `groups` table picked up extra columns from migrations we don't
+        // ship (e.g. uploads from a fork). SQLite leaves unlisted columns at
+        // their DEFAULT / NULL.
         query!(
-            "INSERT OR REPLACE INTO groups VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT OR REPLACE INTO groups (
+                master_key,
+                title,
+                revision,
+                invite_link_password,
+                access_control,
+                avatar,
+                description,
+                members,
+                pending_members,
+                requesting_members
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             master_key,
             g.title,
             g.revision,
@@ -562,7 +577,15 @@ impl ContentsStore for SqliteStore {
         let (given_name, family_name) = name.map(|n| (n.given_name, n.family_name)).unzip();
         let family_name = family_name.flatten();
         query!(
-            "INSERT OR REPLACE INTO profiles VALUES (?, ?, ?, ?, ?, ?, ?)",
+            "INSERT OR REPLACE INTO profiles (
+                uuid,
+                given_name,
+                family_name,
+                about,
+                about_emoji,
+                avatar,
+                unrestricted_unidentified_access
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)",
             uuid,
             given_name,
             family_name,

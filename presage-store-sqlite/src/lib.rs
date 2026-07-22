@@ -85,8 +85,14 @@ impl SqliteStore {
         options: SqliteConnectOptions,
         trust_new_identities: OnNewIdentity,
     ) -> Result<Self, SqliteStoreError> {
+        // We use `Delete` (rollback-journal) rather than WAL because the
+        // hotline persistence layer ships only the main `.db` file to Twilio
+        // Sync; with WAL, un-checkpointed writes live in a `-wal` sidecar that
+        // we don't preserve, so any crash or process exit before checkpoint
+        // produces a "malformed" image on the next download. Rollback journal
+        // keeps the main file authoritative on every commit.
         let options = options
-            .journal_mode(SqliteJournalMode::Wal)
+            .journal_mode(SqliteJournalMode::Delete)
             .synchronous(SqliteSynchronous::Full);
         let db = SqlitePool::connect_with(options).await?;
 
@@ -112,7 +118,12 @@ impl SqliteStore {
                 .await?;
         }
 
-        sqlx::migrate!().run(&db).await?;
+        // Tolerate DBs that were last migrated by a fork or future build of
+        // presage-store-sqlite carrying migrations we don't ship. Without
+        // ignore_missing, sqlx refuses to open the DB at all.
+        let mut migrator = sqlx::migrate!();
+        migrator.set_ignore_missing(true);
+        migrator.run(&db).await?;
         Ok(Self {
             db,
             trust_new_identities,
@@ -152,7 +163,9 @@ impl SqliteStore {
         // Ensure the main DB file contains the full state by folding in and truncating
         // the WAL. Without this, callers that read the raw `.db` file (to ship it to
         // external storage, say) may miss the VACUUM's results until the next open.
-        sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)").execute(&self.db).await?;
+        sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
+            .execute(&self.db)
+            .await?;
         Ok(())
     }
 
