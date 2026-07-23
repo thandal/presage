@@ -21,8 +21,9 @@ curve25519-dalek = { git = 'https://github.com/signalapp/curve25519-dalek', tag 
 quickcheck_async = { git = 'https://github.com/nytopop/quickcheck_async', rev = '76b13525ca93e0725e757f841fc6ccab8bae1913' }
 libsqlite3-sys = { version = "0.36.0", git = "https://github.com/whisperfish/rusqlite", rev = '2a42b3354c9194700d08aa070f70a131a470e7dc' }
 
-# The REST registration path used by presage-cli lives in this fork, not upstream.
-# Swap the `git`/`rev` line for `path = "libsignal-service-rs"` when working against a
-# local checkout, but DO NOT commit that.
+# libsignal-service is vendored in libsignal-service-rs/ so this repo captures a
+# fully buildable state. It is based on thandal/libsignal-service-rs @ 4a837c2
+# (REST registration path used by presage-cli), plus the PNI binary-service-id
+# fixes in src/cipher.rs / src/envelope.rs. Not intended for upstream submission.
 [patch."https://github.com/whisperfish/libsignal-service-rs"]
-libsignal-service = { git = "https://github.com/thandal/libsignal-service-rs", rev = "4a837c286915285728ab71e034daafa1728b52be" }
+libsignal-service = { path = "libsignal-service-rs" }

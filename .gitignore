@@ -11,5 +11,3 @@
 
 # VSCode debugger config
 .vscode/launch.json
-
-.sqlx/

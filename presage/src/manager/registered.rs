@@ -656,9 +656,11 @@ impl<S: Store> Manager<S, Registered> {
 
                             let envelope = {
                                 // the permit is released at the end of the block (impl Drop)
-                                match ServiceId::parse_from_service_id_string(
-                                    envelope.destination_service_id(),
-                                ) {
+                                // NOTE: must use the binary accessor. The server no longer
+                                // populates the legacy string service id fields, so reading
+                                // them routes every PNI-addressed envelope to the ACI cipher,
+                                // which then rejects it as a destination service id mismatch.
+                                match envelope.parse_destination_service_id() {
                                     None | Some(ServiceId::Aci(_)) => {
                                         state
                                             .service_cipher_aci
@@ -667,7 +669,7 @@ impl<S: Store> Manager<S, Registered> {
                                     }
                                     Some(ServiceId::Pni(pni)) => {
                                         if pni == state.service_ids.pni()
-                                            && envelope.source_service_id.is_none()
+                                            && envelope.parse_source_service_id().is_none()
                                         {
                                             warn!("Got a sealed sender message to our PNI? Invalid message, ignoring.");
                                             continue;

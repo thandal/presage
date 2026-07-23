@@ -20,9 +20,6 @@ jobs:
     runs-on: ubuntu-latest
     env:
       RUSTFLAGS: -D warnings
-      # sqlx query! macros validate against this DB at compile time
-      # (the offline .sqlx cache is gitignored, not committed)
-      DATABASE_URL: sqlite:/tmp/presage-ci.db3
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -36,9 +33,6 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y protobuf-compiler
-
-      - name: Create sqlx dev database
-        run: cat presage-store-sqlite/migrations/*.sql | sqlite3 /tmp/presage-ci.db3
 
       - name: Configure CI cache
         uses: Swatinem/rust-cache@v2
@@ -71,10 +65,6 @@ jobs:
   clippy:
     name: clippy
     runs-on: ubuntu-latest
-    env:
-      # sqlx query! macros validate against this DB at compile time
-      # (the offline .sqlx cache is gitignored, not committed)
-      DATABASE_URL: sqlite:/tmp/presage-ci.db3
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -89,9 +79,6 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y protobuf-compiler
-
-      - name: Create sqlx dev database
-        run: cat presage-store-sqlite/migrations/*.sql | sqlite3 /tmp/presage-ci.db3
 
       - name: Setup CI cache
         uses: Swatinem/rust-cache@v2
