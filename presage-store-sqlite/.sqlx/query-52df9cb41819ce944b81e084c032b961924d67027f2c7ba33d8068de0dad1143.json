@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "INSERT OR REPLACE INTO profiles (\n                uuid,\n                given_name,\n                family_name,\n                about,\n                about_emoji,\n                avatar,\n                unrestricted_unidentified_access\n            ) VALUES (?, ?, ?, ?, ?, ?, ?)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 7
+    },
+    "nullable": []
+  },
+  "hash": "52df9cb41819ce944b81e084c032b961924d67027f2c7ba33d8068de0dad1143"
+}
