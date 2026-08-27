@@ -5,7 +5,7 @@ use libsignal_core::{curve::CurveError, InvalidDeviceId};
 use libsignal_protocol::{
     process_prekey_bundle, Aci, DeviceId, IdentityKey, IdentityKeyPair, Pni,
     ProtocolStore, SenderCertificate, SenderKeyStore, ServiceId,
-    SignalProtocolError,
+    SessionNotFound, SignalProtocolError,
 };
 use rand::{rng, CryptoRng, Rng};
 use tracing::{debug, error, info, trace, warn};
@@ -428,28 +428,29 @@ where
         };
 
         if needs_sync || is_multi_device {
-            debug!("sending multi-device sync message");
-            if let Some(sync) = if sync_message {
+            let sync_body = if sync_message {
                 Some(content_body)
             } else {
+                // Only some ContentBody types are syncable to self,
+                // not getting a content body to sync is not an error.
                 self.create_multi_device_sent_transcript_content(
                     Some(recipient),
                     content_body,
                     timestamp,
                     Some(&result),
                 )
-            } {
+            };
+            if let Some(body) = sync_body {
+                debug!("sending multi-device sync message");
                 self.try_send_message(
                     self.local_aci.into(),
                     None,
-                    &sync,
+                    &body,
                     timestamp,
                     false,
                     false,
                 )
                 .await?;
-            } else {
-                error!("could not create sync message from a direct message");
             }
         }
 
@@ -652,6 +653,10 @@ where
 
                         process_prekey_bundle(
                             &remote_address,
+                            &self
+                                .local_aci
+                                .to_protocol_address(self.device_id)
+                                .expect("valid device id"),
                             &mut self.protocol_store.clone(),
                             &mut self.protocol_store,
                             &pre_key,
@@ -914,7 +919,12 @@ where
                     },
                     Err(MessageSenderError::ServiceError(
                         ServiceError::SignalProtocolError(
-                            SignalProtocolError::SessionNotFound(addr),
+                            SignalProtocolError::SessionNotFound(
+                                SessionNotFound {
+                                    address: Some(addr),
+                                    op,
+                                },
+                            ),
                         ),
                     )) => {
                         // SessionNotFound is returned on certain session corruption.
@@ -927,8 +937,10 @@ where
                             Err(error) => {
                                 tracing::warn!(%error, %addr, "failed to delete session");
                                 return Err(
-                                    SignalProtocolError::SessionNotFound(addr)
-                                        .into(),
+                                    SignalProtocolError::SessionNotFound(
+                                        SessionNotFound::new(addr, op),
+                                    )
+                                    .into(),
                                 );
                             },
                         }
@@ -1027,6 +1039,10 @@ where
 
                 process_prekey_bundle(
                     &pre_key_address,
+                    &self
+                        .local_aci
+                        .to_protocol_address(self.device_id)
+                        .expect("valid device id"),
                     &mut self.protocol_store.clone(),
                     &mut self.protocol_store,
                     &pre_key_bundle,
@@ -1051,18 +1067,8 @@ where
         Ok(message)
     }
 
-    /// Send a PlaintextContent envelope (type = PLAINTEXT_CONTENT) to every
-    /// device on the recipient account. Used to deliver a
-    /// DecryptionErrorMessage (retry receipt) after failing to decrypt a
-    /// message: the device whose session is stale archives it and re-handshakes
-    /// via a fresh prekey; healthy devices ignore the DEM (mismatched ratchet
-    /// key). The payload bytes should be a serialized libsignal
-    /// `PlaintextContent` (DEM wrapper).
-    ///
-    /// Sends to *all* devices, not just the originator, because Signal-Server
-    /// validates the device set in `OutgoingPushMessages` and rejects partial
-    /// sends with `MismatchedDevices`. The `originating_device` argument is a
-    /// hint used to ensure that device is included even if no session exists.
+    /// Sends a serialized `PlaintextContent` retry receipt to every known
+    /// device on an account, reconciling the server's device list as needed.
     #[tracing::instrument(level = "trace", skip(self, plaintext_content_bytes))]
     pub async fn send_plaintext_content(
         &mut self,
@@ -1072,13 +1078,10 @@ where
         timestamp: u64,
     ) -> Result<(), MessageSenderError> {
         use base64::prelude::*;
-        use crate::proto::envelope::Type;
-        use crate::utils::BASE64_RELAXED;
+
+        use crate::{proto::envelope::Type, utils::BASE64_RELAXED};
 
         let mut rng = rng();
-
-        // Initial device set: anything we already have a session for, plus the
-        // primary, plus the device that originated the failed message.
         let mut devices: HashSet<DeviceId> = self
             .protocol_store
             .get_sub_device_sessions(recipient)
@@ -1088,40 +1091,51 @@ where
         devices.insert(*DEFAULT_DEVICE_ID);
         devices.insert(originating_device);
 
-        // For any device without a session, fetch a prekey bundle for the
-        // whole account in one shot (`/v2/keys/<id>/*` returns all devices).
-        let any_missing = {
-            let mut any = false;
-            for d in &devices {
-                let addr = recipient.to_protocol_address(*d);
-                if self.protocol_store.load_session(&addr).await?.is_none() {
-                    any = true;
-                    break;
-                }
+        let mut any_missing = false;
+        for device in &devices {
+            let address = recipient.to_protocol_address(*device);
+            if self
+                .protocol_store
+                .load_session(&address)
+                .await?
+                .is_none()
+            {
+                any_missing = true;
+                break;
             }
-            any
-        };
+        }
+
         if any_missing {
             let pre_keys = match self
                 .identified_ws
                 .get_pre_keys(recipient, *DEFAULT_DEVICE_ID)
                 .await
             {
-                Ok(ok) => ok,
+                Ok(pre_keys) => pre_keys,
                 Err(ServiceError::NotFoundError) => {
                     return Err(MessageSenderError::NotFound {
                         service_id: *recipient,
                     });
                 },
-                Err(e) => return Err(e.into()),
+                Err(error) => return Err(error.into()),
             };
+
             for bundle in pre_keys {
-                let dev = bundle.device_id()?;
-                devices.insert(dev);
-                let addr = recipient.to_protocol_address(dev);
-                if self.protocol_store.load_session(&addr).await?.is_none() {
+                let device = bundle.device_id()?;
+                devices.insert(device);
+                let address = recipient.to_protocol_address(device);
+                if self
+                    .protocol_store
+                    .load_session(&address)
+                    .await?
+                    .is_none()
+                {
                     process_prekey_bundle(
-                        &addr,
+                        &address,
+                        &self
+                            .local_aci
+                            .to_protocol_address(self.device_id)
+                            .expect("valid device id"),
                         &mut self.protocol_store.clone(),
                         &mut self.protocol_store,
                         &bundle,
@@ -1134,63 +1148,65 @@ where
         }
 
         for attempt in 0..3u8 {
-            // Build one PlaintextContent message per device.
-            let mut msgs = Vec::with_capacity(devices.len());
-            for d in &devices {
-                let addr = recipient.to_protocol_address(*d);
-                let session = match self
+            let mut messages = Vec::with_capacity(devices.len());
+            for device in &devices {
+                let address = recipient.to_protocol_address(*device);
+                let Some(session) = self
                     .protocol_store
-                    .load_session(&addr)
+                    .load_session(&address)
                     .await?
-                {
-                    Some(s) => s,
-                    None => continue,
+                else {
+                    continue;
                 };
-                let reg_id = session.remote_registration_id()?;
-                msgs.push(OutgoingPushMessage {
+                messages.push(OutgoingPushMessage {
                     r#type: Type::PlaintextContent as u32,
-                    destination_device_id: *d,
-                    destination_registration_id: reg_id,
-                    content: BASE64_RELAXED
-                        .encode(plaintext_content_bytes),
+                    destination_device_id: *device,
+                    destination_registration_id: session
+                        .remote_registration_id()?,
+                    content: BASE64_RELAXED.encode(plaintext_content_bytes),
                 });
             }
-            if msgs.is_empty() {
+
+            if messages.is_empty() {
                 return Err(MessageSenderError::NotFound {
                     service_id: *recipient,
                 });
             }
 
-            let out = OutgoingPushMessages {
+            let outgoing = OutgoingPushMessages {
                 destination: *recipient,
                 timestamp,
-                messages: msgs,
+                messages,
                 online: false,
             };
 
-            match self.identified_ws.send_messages(out).await {
+            match self.identified_ws.send_messages(outgoing).await {
                 Ok(_) => return Ok(()),
-                Err(ServiceError::MismatchedDevicesException(m)) => {
+                Err(ServiceError::MismatchedDevicesException(mismatch)) => {
                     tracing::debug!(
-                        ?m,
+                        ?mismatch,
                         attempt,
-                        "DEM send returned MismatchedDevices; reconciling"
+                        "retry receipt returned mismatched devices"
                     );
-                    for extra in &m.extra_devices {
-                        let addr = recipient.to_protocol_address(*extra);
+                    for extra in &mismatch.extra_devices {
+                        let address = recipient.to_protocol_address(*extra);
                         self.protocol_store
-                            .delete_service_addr_device_session(&addr)
+                            .delete_service_addr_device_session(&address)
                             .await?;
                         devices.remove(extra);
                     }
-                    for missing in &m.missing_devices {
-                        let addr = recipient.to_protocol_address(*missing);
+                    for missing in &mismatch.missing_devices {
+                        let address = recipient.to_protocol_address(*missing);
                         let bundle = self
                             .identified_ws
                             .get_pre_key(recipient, *missing)
                             .await?;
                         process_prekey_bundle(
-                            &addr,
+                            &address,
+                            &self
+                                .local_aci
+                                .to_protocol_address(self.device_id)
+                                .expect("valid device id"),
                             &mut self.protocol_store.clone(),
                             &mut self.protocol_store,
                             &bundle,
@@ -1198,38 +1214,41 @@ where
                             &mut rng,
                         )
                         .await
-                        .map_err(|_| {
-                            MessageSenderError::UntrustedIdentity {
-                                address: *recipient,
-                            }
+                        .map_err(|_| MessageSenderError::UntrustedIdentity {
+                            address: *recipient,
                         })?;
                         devices.insert(*missing);
                     }
                     if attempt == 2 {
                         return Err(MessageSenderError::ServiceError(
-                            ServiceError::MismatchedDevicesException(m),
+                            ServiceError::MismatchedDevicesException(mismatch),
                         ));
                     }
                 },
-                Err(ServiceError::StaleDevices(s)) => {
-                    tracing::debug!(?s, attempt, "DEM send returned StaleDevices; dropping");
-                    for stale in &s.stale_devices {
-                        let addr = recipient.to_protocol_address(*stale);
+                Err(ServiceError::StaleDevices(stale)) => {
+                    tracing::debug!(
+                        ?stale,
+                        attempt,
+                        "retry receipt returned stale devices"
+                    );
+                    for device in &stale.stale_devices {
+                        let address = recipient.to_protocol_address(*device);
                         self.protocol_store
-                            .delete_service_addr_device_session(&addr)
+                            .delete_service_addr_device_session(&address)
                             .await?;
-                        devices.remove(stale);
+                        devices.remove(device);
                     }
                     if attempt == 2 {
                         return Err(MessageSenderError::ServiceError(
-                            ServiceError::StaleDevices(s),
+                            ServiceError::StaleDevices(stale),
                         ));
                     }
                 },
-                Err(e) => return Err(e.into()),
+                Err(error) => return Err(error.into()),
             }
         }
-        unreachable!("DEM send loop must return inside the match")
+
+        unreachable!("retry receipt send loop always returns")
     }
 
     fn create_multi_device_sent_transcript_content<'a>(
@@ -1243,7 +1262,10 @@ where
         let (message, edit_message) = match content_body {
             ContentBody::DataMessage(m) => (Some(m), None),
             ContentBody::EditMessage(m) => (None, Some(m)),
-            _ => return None,
+            content_body => {
+                tracing::trace!(?content_body, "not syncing to self");
+                return None;
+            },
         };
         let unidentified_status: Vec<UnidentifiedDeliveryStatus> =
             send_message_results

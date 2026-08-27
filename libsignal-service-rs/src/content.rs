@@ -1,5 +1,7 @@
+use chrono::Utc;
 use libsignal_core::DeviceId;
 use libsignal_protocol::{ProtocolAddress, ServiceId};
+use prost::Message;
 use std::fmt;
 use uuid::Uuid;
 
@@ -7,9 +9,10 @@ pub use crate::{
     proto::{
         attachment_pointer::Flags as AttachmentPointerFlags,
         data_message::Flags as DataMessageFlags, data_message::Reaction,
-        sync_message, AttachmentPointer, CallMessage, DataMessage, EditMessage,
-        GroupContextV2, NullMessage, PniSignatureMessage, ReceiptMessage,
-        StoryMessage, SyncMessage, TypingMessage,
+        sync_message, AttachmentPointer, CallMessage, DataMessage,
+        DecryptionErrorMessage, EditMessage, GroupContextV2, NullMessage,
+        PniSignatureMessage, ReceiptMessage, StoryMessage, SyncMessage,
+        TypingMessage,
     },
     push_service::ServiceError,
     ServiceIdExt,
@@ -23,7 +26,8 @@ pub struct Metadata {
     pub sender: ServiceId,
     pub destination: ServiceId,
     pub sender_device: DeviceId,
-    pub timestamp: u64,
+    pub timestamp: chrono::DateTime<Utc>,
+    pub server_timestamp: chrono::DateTime<Utc>,
     pub needs_receipt: bool,
     pub unidentified_sender: bool,
     pub was_plaintext: bool,
@@ -38,13 +42,14 @@ impl fmt::Display for Metadata {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "Metadata {{ sender: {}, guid: {} }}",
+            "Metadata {{ sender: {}, guid: {}, server timestamp: {} }}",
             self.sender.service_id_string(),
             // XXX: should this still be optional?
             self.server_guid
                 .map(|u| u.to_string())
                 .as_deref()
                 .unwrap_or("None"),
+            self.server_timestamp,
         )
     }
 }
@@ -94,13 +99,20 @@ impl Content {
             Ok(Self::from_body(msg, metadata))
         // } else if let Some(msg) = p.sender_key_distribution_message {
         //     Ok(Self::from_body(msg, metadata))
-        // } else if let Some(msg) = p.decryption_error_message {
-        //     Ok(Self::from_body(msg, metadata))
+        } else if let Some(msg) = p.decryption_error_message {
+            Ok(Self {
+                metadata,
+                body: ContentBody::DecryptionErrorMessage(
+                    DecryptionErrorMessage::decode(msg.as_ref())?,
+                ),
+            })
         } else if let Some(msg) = p.story_message {
             Ok(Self::from_body(msg, metadata))
         } else if let Some(msg) = p.pni_signature_message {
             Ok(Self::from_body(msg, metadata))
         } else if let Some(msg) = p.edit_message {
+            Ok(Self::from_body(msg, metadata))
+        } else if let Some(msg) = p.null_message {
             Ok(Self::from_body(msg, metadata))
         } else {
             Err(ServiceError::UnsupportedContent)
@@ -140,7 +152,9 @@ impl fmt::Display for ContentBody {
             Self::ReceiptMessage(_) => write!(f, "ReceiptMessage"),
             Self::TypingMessage(_) => write!(f, "TypingMessage"),
             // Self::SenderKeyDistributionMessage(_) => write!(f, "SenderKeyDistributionMessage"),
-            // Self::DecryptionErrorMessage(_) => write!(f, "DecryptionErrorMessage"),
+            Self::DecryptionErrorMessage(_) => {
+                write!(f, "DecryptionErrorMessage")
+            },
             Self::StoryMessage(_) => write!(f, "StoryMessage"),
             Self::PniSignatureMessage(_) => write!(f, "PniSignatureMessage"),
             Self::EditMessage(_) => write!(f, "EditMessage"),
@@ -158,10 +172,22 @@ pub enum ContentBody {
     ReceiptMessage(ReceiptMessage),
     TypingMessage(TypingMessage),
     // SenderKeyDistributionMessage(SenderKeyDistributionMessage),
-    // DecryptionErrorMessage(DecryptionErrorMessage),
+    DecryptionErrorMessage(DecryptionErrorMessage),
     StoryMessage(StoryMessage),
     PniSignatureMessage(PniSignatureMessage),
     EditMessage(EditMessage),
+}
+
+impl NullMessage {
+    pub fn generate<R: rand::Rng + rand::CryptoRng>(rng: &mut R) -> Self {
+        // Random length between 1 and 140 bytes
+        let padding_length = (rng.next_u64() % 140) as usize + 1;
+        let mut padding = vec![0; padding_length];
+        rng.fill(padding.as_mut_slice());
+        NullMessage {
+            padding: Some(padding),
+        }
+    }
 }
 
 impl ContentBody {
@@ -197,10 +223,10 @@ impl ContentBody {
             //     sender_key_distribution_message: Some(msg),
             //     ..Default::default()
             // },
-            // Self::DecryptionErrorMessage(msg) => crate::proto::Content {
-            //     decryption_error_message: Some(msg.serialized()),
-            //     ..Default::default()
-            // },
+            Self::DecryptionErrorMessage(msg) => crate::proto::Content {
+                decryption_error_message: Some(msg.encode_to_vec()),
+                ..Default::default()
+            },
             Self::StoryMessage(msg) => crate::proto::Content {
                 story_message: Some(msg),
                 ..Default::default()

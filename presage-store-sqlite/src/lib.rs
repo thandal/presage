@@ -1,12 +1,14 @@
-use std::borrow::Cow;
+use std::{borrow::Cow, str::FromStr};
 
 use presage::{
-    libsignal_service::{prelude::MasterKey, protocol::SenderCertificate},
+    libsignal_service::{
+        libsignal_account_keys::AccountEntropyPool, prelude::MasterKey, protocol::SenderCertificate,
+    },
     store::{StateStore, Store},
 };
 use protocol::{IdentityType, SqliteProtocolStore};
 use sqlx::{
-    SqlitePool,
+    AssertSqlSafe, SqlSafeStr, SqlitePool,
     migrate::{Migrate, Migration, MigrationType},
     query, query_scalar,
     sqlite::{SqliteJournalMode, SqliteSynchronous},
@@ -34,8 +36,7 @@ impl SqliteStore {
         url: &str,
         trust_new_identities: OnNewIdentity,
     ) -> Result<Self, SqliteStoreError> {
-        let options: SqliteConnectOptions = url.parse()?;
-        Self::open_with_options(options, trust_new_identities).await
+        Self::open_with_passphrase(url, None, trust_new_identities).await
     }
 
     pub async fn open_with_passphrase(
@@ -53,32 +54,7 @@ impl SqliteStore {
         } else {
             options
         };
-        match Self::open_with_options(options.clone(), trust_new_identities.clone()).await {
-            Ok(s) => Ok(s),
-            // The error "file is not a database" (error code 26) could mean that we provided a key for decrypting the database, but the database was actually not encrypted due to a bug in earlier versions of presage-store-sqlite.
-            // If that is the case, try to migrate the database to be encrypted.
-            Err(SqliteStoreError::Migrate(sqlx::migrate::MigrateError::Execute(
-                sqlx::Error::Database(e),
-            ))) if e.code().is_some_and(|c| c.as_ref() == "26") => {
-                // Attempting migration only makes sense if a passphrase is given, otherwise just return the error.
-                let Some(passphrase) = passphrase else {
-                    return Err(SqliteStoreError::Migrate(
-                        sqlx::migrate::MigrateError::Execute(sqlx::Error::Database(e)),
-                    ));
-                };
-
-                // It does not make sense to try a migration of an in-memory database.
-                // Also abort in that case.
-                if url == ":memory:" {
-                    return Err(SqliteStoreError::Migrate(
-                        sqlx::migrate::MigrateError::Execute(sqlx::Error::Database(e)),
-                    ));
-                }
-
-                Self::open_migrate_to_encrypted(url, &passphrase, trust_new_identities).await
-            }
-            Err(e) => Err(e),
-        }
+        Self::open_with_options(options.clone(), trust_new_identities.clone()).await
     }
 
     pub async fn open_with_options(
@@ -100,21 +76,25 @@ impl SqliteStore {
         // Revert this migration, which got instead replaced by 20260119182700_remove_device_id_from_identities.sql.
         // This revert code should be removable once it was shipped to the affected users.
         let mut connection = db.acquire().await?;
-        connection.ensure_migrations_table().await?;
+        const MIGRATIONS_TABLE: &str = "_sqlx_migrations";
+        connection.ensure_migrations_table(MIGRATIONS_TABLE).await?;
         if connection
-            .list_applied_migrations()
+            .list_applied_migrations(MIGRATIONS_TABLE)
             .await?
             .iter()
             .any(|m| m.version == 20260101163100)
         {
             connection
-                .revert(&Migration::new(
-                    20260101163100,
-                    Cow::Borrowed("revert broken identities migration"),
-                    MigrationType::ReversibleDown,
-                    Cow::Borrowed("ALTER TABLE identities ADD COLUMN device_id DEFAULT 1"),
-                    false,
-                ))
+                .revert(
+                    MIGRATIONS_TABLE,
+                    &Migration::new(
+                        20260101163100,
+                        Cow::Borrowed("revert broken identities migration"),
+                        MigrationType::ReversibleDown,
+                        "ALTER TABLE identities ADD COLUMN device_id DEFAULT 1".into_sql_str(),
+                        false,
+                    ),
+                )
                 .await?;
         }
 
@@ -129,7 +109,6 @@ impl SqliteStore {
             trust_new_identities,
         })
     }
-
     /// Deletes rows from cache-only tables and VACUUMs the database, shrinking it to the
     /// minimum state needed to keep writing to existing conversations. Intended for operators
     /// who want to run a send-only client on storage-constrained backends (e.g. serverless
@@ -196,12 +175,12 @@ impl SqliteStore {
         // Note that `raw_sql` does not support query parameters (https://docs.rs/sqlx/latest/sqlx/fn.raw_sql.html#note-query-parameters-are-not-supported).
         // Therefore, in theory, an sql-injection could be possible.
         // But we escape the `encrypted_url`, and assume the passphrase to already be escaped, so I don't think an injection is actually possible.
-        sqlx::raw_sql(&format!(
+        sqlx::raw_sql(AssertSqlSafe(format!(
             "ATTACH DATABASE '{}' AS encrypted KEY '{passphrase}';
             SELECT sqlcipher_export('encrypted');
             DETACH DATABASE encrypted;",
             encrypted_url.replace("'", "''")
-        ))
+        )))
         .execute(&no_password_db.db)
         .await?;
 
@@ -374,12 +353,54 @@ impl StateStore for SqliteStore {
         master_key: Option<&MasterKey>,
     ) -> Result<(), Self::StateStoreError> {
         let value = master_key.map(|k| &k.inner[..]);
-        query!(
-            "INSERT OR REPLACE INTO kv (key, value) VALUES ('master_key', ?)",
-            value
-        )
-        .execute(&self.db)
-        .await?;
+        if let Some(value) = value {
+            query!(
+                "INSERT OR REPLACE INTO kv (key, value) VALUES ('master_key', ?)",
+                value
+            )
+            .execute(&self.db)
+            .await?;
+        } else {
+            query!("DELETE FROM kv WHERE key = 'master_key'")
+                .execute(&self.db)
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn fetch_account_entropy_pool(
+        &self,
+    ) -> Result<Option<AccountEntropyPool>, Self::StateStoreError> {
+        query_scalar!("SELECT value FROM kv WHERE key = 'account_entropy_pool' LIMIT 1")
+            .fetch_optional(&self.db)
+            .await?
+            .map(|value| {
+                AccountEntropyPool::from_str(
+                    str::from_utf8(&value).map_err(|_| SqliteStoreError::InvalidFormat)?,
+                )
+                .map_err(|_| SqliteStoreError::InvalidFormat)
+            })
+            .transpose()
+            .map_err(|_| SqliteStoreError::InvalidFormat)
+    }
+
+    async fn store_account_entropy_pool(
+        &self,
+        aep: Option<&AccountEntropyPool>,
+    ) -> Result<(), Self::StateStoreError> {
+        let value = aep.map(|k| k.to_string().into_bytes());
+        if let Some(value) = value {
+            query!(
+                "INSERT OR REPLACE INTO kv (key, value) VALUES ('account_entropy_pool', ?)",
+                value
+            )
+            .execute(&self.db)
+            .await?;
+        } else {
+            query!("DELETE FROM kv WHERE key = 'account_entropy_pool'")
+                .execute(&self.db)
+                .await?;
+        }
         Ok(())
     }
 }

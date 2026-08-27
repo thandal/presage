@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::convert::{TryFrom, TryInto};
 
 use aes::cipher::{KeyIvInit, StreamCipher as _};
-use hmac::digest::Output;
+use hmac::{digest::Output, KeyInit};
 use hmac::{Hmac, Mac};
 use libsignal_protocol::{
     kem, Aci, GenericSignedPreKey, IdentityKey, IdentityKeyPair,
@@ -20,7 +20,6 @@ use tracing_futures::Instrument;
 use zkgroup::profiles::ProfileKey;
 
 use crate::content::ContentBody;
-use crate::master_key::MasterKey;
 use crate::pre_keys::{
     KyberPreKeyEntity, PreKeyEntity, PreKeysStore, SignedPreKeyEntity,
     PRE_KEY_BATCH_SIZE, PRE_KEY_MINIMUM,
@@ -28,7 +27,7 @@ use crate::pre_keys::{
 use crate::prelude::{MessageSender, MessageSenderError};
 use crate::proto::sync_message::PniChangeNumber;
 use crate::proto::{DeviceName, SyncMessage};
-use crate::provisioning::generate_registration_id;
+use crate::provisioning::{generate_registration_id, ProvisioningSecrets};
 use crate::push_service::{
     AvatarWrite, HttpAuthOverride, ReqwestExt, DEFAULT_DEVICE_ID,
 };
@@ -39,13 +38,10 @@ use crate::timestamp::TimestampExt as _;
 use crate::utils::{random_length_padding, BASE64_RELAXED};
 use crate::websocket::account::DeviceInfo;
 use crate::websocket::keys::PreKeyStatus;
-use crate::websocket::registration::{
-    CaptchaAttributes, DeviceActivationRequest, RegistrationMethod,
-    VerifyAccountResponse,
-};
+use crate::websocket::registration::CaptchaAttributes;
 use crate::websocket::{self, SignalWebSocket};
 use crate::{
-    configuration::{Endpoint, ServiceCredentials},
+    configuration::Endpoint,
     pre_keys::PreKeyState,
     profile_cipher::{ProfileCipher, ProfileCipherError},
     profile_name::ProfileName,
@@ -362,9 +358,16 @@ impl AccountManager {
         url: url::Url,
         aci_identity_store: &dyn IdentityKeyStore,
         pni_identity_store: &dyn IdentityKeyStore,
-        credentials: ServiceCredentials,
-        master_key: Option<MasterKey>,
+        secrets: ProvisioningSecrets,
     ) -> Result<(), ProvisioningError> {
+        let ProvisioningSecrets {
+            credentials,
+            master_key,
+            ephemeral_backup_key,
+            account_entropy_pool,
+            media_root_backup_key,
+        } = secrets;
+
         let query: HashMap<_, _> = url.query_pairs().collect();
         let ephemeral_id =
             query.get("uuid").ok_or(ProvisioningError::MissingUuid)?;
@@ -392,36 +395,37 @@ impl AccountManager {
 
         let provisioning_code = self.new_device_provisioning_code().await?;
 
+        // Same order as in Provisioning.proto for helping comparison.
         let msg = ProvisionMessage {
-            aci: credentials.aci.as_ref().map(|u| u.to_string()),
-            aci_binary: credentials.aci.map(|u| u.into_bytes().into()),
             aci_identity_key_public: Some(
                 aci_identity_key_pair.public_key().serialize().into_vec(),
             ),
             aci_identity_key_private: Some(
                 aci_identity_key_pair.private_key().serialize(),
             ),
-            number: Some(credentials.e164()),
             pni_identity_key_public: Some(
                 pni_identity_key_pair.public_key().serialize().into_vec(),
             ),
             pni_identity_key_private: Some(
                 pni_identity_key_pair.private_key().serialize(),
             ),
+            aci: credentials.aci.as_ref().map(|u| u.to_string()),
             pni: credentials.pni.as_ref().map(uuid::Uuid::to_string),
-            pni_binary: credentials.pni.map(|u| u.into_bytes().into()),
+            number: Some(credentials.e164()),
+            provisioning_code: Some(provisioning_code),
+            user_agent: None,
             profile_key: self.profile_key.as_ref().map(|x| x.bytes.to_vec()),
             // CURRENT is not exposed by prost :(
+            read_receipts: None,
             provisioning_version: Some(i32::from(
                 ProvisioningVersion::TabletSupport,
             ) as _),
-            provisioning_code: Some(provisioning_code),
-            read_receipts: None,
-            user_agent: None,
             master_key: master_key.map(|x| x.into()),
-            ephemeral_backup_key: None,
-            account_entropy_pool: None,
-            media_root_backup_key: None,
+            ephemeral_backup_key: ephemeral_backup_key.map(|k| k.to_vec()), // 32-bytes
+            account_entropy_pool: Some(account_entropy_pool.to_string()),
+            media_root_backup_key: media_root_backup_key.map(|k| k.to_vec()), // 32-bytes
+            aci_binary: credentials.aci.map(|u| u.into_bytes().into()),
+            pni_binary: credentials.pni.map(|u| u.into_bytes().into()),
         };
 
         let cipher = ProvisioningCipher::from_public(pub_key);
@@ -468,87 +472,6 @@ impl AccountManager {
                 })
             })
             .collect()
-    }
-
-    pub async fn register_account<
-        R: Rng + CryptoRng,
-        Aci: PreKeysStore + IdentityKeyStore,
-        Pni: PreKeysStore + IdentityKeyStore,
-    >(
-        &mut self,
-        csprng: &mut R,
-        registration_method: RegistrationMethod<'_>,
-        account_attributes: AccountAttributes,
-        aci_protocol_store: &mut Aci,
-        pni_protocol_store: &mut Pni,
-        skip_device_transfer: bool,
-    ) -> Result<VerifyAccountResponse, ProvisioningError> {
-        let aci_identity_key_pair = aci_protocol_store
-            .get_identity_key_pair()
-            .instrument(tracing::trace_span!("get ACI identity key pair"))
-            .await?;
-        let pni_identity_key_pair = pni_protocol_store
-            .get_identity_key_pair()
-            .instrument(tracing::trace_span!("get PNI identity key pair"))
-            .await?;
-
-        let (
-            _aci_pre_keys,
-            aci_signed_pre_key,
-            _aci_kyber_pre_keys,
-            aci_last_resort_kyber_prekey,
-        ) = crate::pre_keys::replenish_pre_keys(
-            aci_protocol_store,
-            csprng,
-            &aci_identity_key_pair,
-            true,
-            0,
-            0,
-        )
-        .await?;
-
-        let (
-            _pni_pre_keys,
-            pni_signed_pre_key,
-            _pni_kyber_pre_keys,
-            pni_last_resort_kyber_prekey,
-        ) = crate::pre_keys::replenish_pre_keys(
-            pni_protocol_store,
-            csprng,
-            &pni_identity_key_pair,
-            true,
-            0,
-            0,
-        )
-        .await?;
-
-        let aci_identity_key = aci_identity_key_pair.identity_key();
-        let pni_identity_key = pni_identity_key_pair.identity_key();
-
-        let dar = DeviceActivationRequest {
-            aci_signed_pre_key: aci_signed_pre_key.try_into()?,
-            pni_signed_pre_key: pni_signed_pre_key.try_into()?,
-            aci_pq_last_resort_pre_key: aci_last_resort_kyber_prekey
-                .expect("requested last resort prekey")
-                .try_into()?,
-            pni_pq_last_resort_pre_key: pni_last_resort_kyber_prekey
-                .expect("requested last resort prekey")
-                .try_into()?,
-        };
-
-        let result = self
-            .websocket
-            .submit_registration_request(
-                registration_method,
-                account_attributes,
-                skip_device_transfer,
-                aci_identity_key,
-                pni_identity_key,
-                dar,
-            )
-            .await?;
-
-        Ok(result)
     }
 
     /// Upload a profile
@@ -990,8 +913,23 @@ fn decrypt_device_name_from_device_info(
     string: &str,
     aci: &IdentityKeyPair,
 ) -> Result<String, ServiceError> {
-    let data = BASE64_RELAXED.decode(string)?;
-    let name = DeviceName::decode(&*data)?;
+    let Ok(data) = BASE64_RELAXED.decode(string) else {
+        tracing::trace!(
+            "Device name not base64 encoded, assuming plaintext: {}",
+            string.to_string()
+        );
+        return Ok(string.to_string());
+    };
+    let name = match DeviceName::decode(data.as_slice()) {
+        Ok(decoded) => decoded,
+        Err(_) => {
+            tracing::trace!(
+                "Decoding device name failed, assuming plaintext: {}",
+                string.to_string()
+            );
+            return Ok(string.to_string());
+        },
+    };
     crate::decrypt_device_name(aci.private_key(), &name)
 }
 
@@ -1047,8 +985,7 @@ pub fn decrypt_device_name(
 
     let mut plaintext = ciphertext.to_vec();
     const IV: [u8; 16] = [0; 16];
-    let mut cipher =
-        Aes256Ctr128BE::new(cipher_key.as_slice().into(), &IV.into());
+    let mut cipher = Aes256Ctr128BE::new(&cipher_key, &IV.into());
     cipher.apply_keystream(&mut plaintext);
 
     let key1 = calculate_hmac256(&master_secret, b"auth")?;

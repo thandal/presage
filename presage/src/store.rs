@@ -1,10 +1,11 @@
 //! Traits that are used by the manager for storing the data.
 
-use std::{fmt, future::Future, ops::RangeBounds, time::SystemTime};
+use std::{fmt, future::Future, ops::RangeBounds};
 
 use libsignal_service::{
     content::{ContentBody, Metadata},
     groups_v2::Timer,
+    libsignal_account_keys::AccountEntropyPool,
     pre_keys::PreKeysStore,
     prelude::{Content, MasterKey, ProfileKey, Uuid},
     proto::{
@@ -80,6 +81,15 @@ pub trait StateStore {
         &self,
         master_key: Option<&MasterKey>,
     ) -> impl Future<Output = Result<(), Self::StateStoreError>>;
+
+    fn fetch_account_entropy_pool(
+        &self,
+    ) -> impl Future<Output = Result<Option<AccountEntropyPool>, Self::StateStoreError>>;
+
+    fn store_account_entropy_pool(
+        &self,
+        aep: Option<&AccountEntropyPool>,
+    ) -> impl Future<Output = Result<(), Self::StateStoreError>>;
 }
 
 /// Stores messages, contacts, groups and profiles
@@ -139,6 +149,13 @@ pub trait ContentsStore: Send + Sync {
         timestamp: u64,
     ) -> impl Future<Output = Result<Option<Content>, Self::ContentsStoreError>>;
 
+    /// Retrieve a message [Thread] from its sender and timestamp.
+    fn thread_for_sender_and_timestamp(
+        &self,
+        sender: &ServiceId,
+        timestamp: u64,
+    ) -> impl Future<Output = Result<Option<Thread>, Self::ContentsStoreError>>;
+
     /// Retrieve all messages from a [Thread] within a range in time
     fn messages(
         &self,
@@ -195,7 +212,12 @@ pub trait ContentsStore: Send + Sync {
                 Thread::Group(key) => {
                     let group = self.group(*key).await?;
                     if let Some(mut g) = group {
-                        g.disappearing_messages_timer = Some(Timer { duration: timer });
+                        // Convert timer=0 to None for groups (disable disappearing messages)
+                        g.disappearing_messages_timer = if timer == 0 {
+                            None
+                        } else {
+                            Some(Timer { duration: timer })
+                        };
                         self.save_group(*key, g).await?;
                     }
                     Ok(())
@@ -522,7 +544,7 @@ impl ContentExt for Content {
                 target_sent_timestamp: Some(ts),
                 ..
             }) => ts,
-            _ => self.metadata.timestamp,
+            _ => self.metadata.timestamp.timestamp_millis() as u64,
         }
     }
 }
@@ -595,10 +617,9 @@ pub async fn save_trusted_identity_message<S: Store>(
             destination: sender,
             sender_device: *DEFAULT_DEVICE_ID,
             server_guid: None,
-            timestamp: SystemTime::now()
-                .duration_since(SystemTime::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis() as u64,
+            timestamp: chrono::Utc::now(),
+            // No messages were sent, just use the current time as the server timestamp.
+            server_timestamp: chrono::Utc::now(),
             needs_receipt: false,
             unidentified_sender: false,
             was_plaintext: false,

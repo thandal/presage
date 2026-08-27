@@ -2,11 +2,33 @@ use std::{convert::TryFrom, convert::TryInto};
 
 use libsignal_protocol::{Aci, Pni, ServiceId};
 use serde::{Deserialize, Serialize};
-use zkgroup::profiles::ProfileKey;
+use zkgroup::profiles::{ExpiringProfileKeyCredential, ProfileKey};
 
 use crate::sender::GroupV2Id;
 
 use super::GroupDecodingError;
+
+/// A candidate member for group creation/modification.
+///
+/// If credential is Some, member will be added with a presentation.
+/// If credential is None, member will be added as pending (invite).
+#[derive(Clone)]
+pub struct GroupMemberCandidate {
+    pub service_id: ServiceId,
+    pub credential: Option<ExpiringProfileKeyCredential>,
+}
+
+impl std::fmt::Debug for GroupMemberCandidate {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GroupCandidate")
+            .field("service_id", &self.service_id)
+            .field(
+                "credential",
+                &self.credential.as_ref().map(|_| "[credential]"),
+            )
+            .finish()
+    }
+}
 
 #[derive(Copy, Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum Role {
@@ -22,7 +44,9 @@ pub struct Member {
     pub role: Role,
     #[debug(ignore)]
     pub profile_key: ProfileKey,
-    pub joined_at_revision: u32,
+    pub joined_at_version: u32,
+    pub label: Option<String>,
+    pub label_emoji: Option<String>,
 }
 
 impl PartialEq for Member {
@@ -80,13 +104,13 @@ impl PartialEq for RequestingMember {
 
 #[derive(Debug, Clone)]
 pub struct BannedMember {
-    pub service_id: ServiceId,
+    pub user_id: ServiceId,
     pub timestamp: u64,
 }
 
 impl PartialEq for BannedMember {
     fn eq(&self, other: &Self) -> bool {
-        self.service_id == other.service_id
+        self.user_id == other.user_id
     }
 }
 
@@ -118,6 +142,7 @@ pub struct AccessControl {
     pub attributes: AccessRequired,
     pub members: AccessRequired,
     pub add_from_invite_link: AccessRequired,
+    pub member_label: AccessRequired,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -126,21 +151,21 @@ pub struct Group {
     pub avatar: String,
     pub disappearing_messages_timer: Option<Timer>,
     pub access_control: Option<AccessControl>,
-    pub revision: u32,
+    pub version: u32,
     pub members: Vec<Member>,
-    pub pending_members: Vec<PendingMember>,
-    pub requesting_members: Vec<RequestingMember>,
+    pub members_pending_profile_key: Vec<PendingMember>,
+    pub members_pending_admin_approval: Vec<RequestingMember>,
     pub invite_link_password: Vec<u8>,
-    pub description: Option<String>,
+    pub description_text: Option<String>,
     pub announcements_only: bool,
-    pub banned_members: Vec<BannedMember>,
+    pub members_banned: Vec<BannedMember>,
 }
 
 #[derive(Debug, Clone)]
 pub struct GroupChanges {
     pub group_id: GroupV2Id,
     pub editor: Aci,
-    pub revision: u32,
+    pub version: u32,
     pub changes: Vec<GroupChange>,
     pub change_epoch: u32,
 }
@@ -183,6 +208,12 @@ pub enum GroupChange {
     AddBannedMember(BannedMember),
     DeleteBannedMember(ServiceId),
     PromotePendingPniAciMemberProfileKey(PromotedMember),
+    MemberLabel {
+        user_id: ServiceId,
+        label_emoji: Option<String>,
+        label_string: Option<String>,
+    },
+    MemberLabelAccess(AccessRequired),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
@@ -196,11 +227,11 @@ impl TryFrom<i32> for Role {
     type Error = GroupDecodingError;
 
     fn try_from(value: i32) -> Result<Self, Self::Error> {
-        use crate::proto::member::Role::*;
+        use crate::proto::member::Role as ProtoRole;
         match crate::proto::member::Role::try_from(value) {
-            Ok(Unknown) => Ok(Role::Unknown),
-            Ok(Default) => Ok(Role::Default),
-            Ok(Administrator) => Ok(Role::Administrator),
+            Ok(ProtoRole::Unknown) => Ok(Role::Unknown),
+            Ok(ProtoRole::Default) => Ok(Role::Default),
+            Ok(ProtoRole::Administrator) => Ok(Role::Administrator),
             Err(_e) => Err(GroupDecodingError::WrongEnumValue),
         }
     }
@@ -222,13 +253,17 @@ impl TryFrom<i32> for AccessRequired {
     type Error = GroupDecodingError;
 
     fn try_from(value: i32) -> Result<Self, Self::Error> {
-        use crate::proto::access_control::AccessRequired::*;
+        use crate::proto::access_control::AccessRequired as ProtoAccessRequired;
         match crate::proto::access_control::AccessRequired::try_from(value) {
-            Ok(Unknown) => Ok(AccessRequired::Unknown),
-            Ok(Any) => Ok(AccessRequired::Any),
-            Ok(Member) => Ok(AccessRequired::Member),
-            Ok(Administrator) => Ok(AccessRequired::Administrator),
-            Ok(Unsatisfiable) => Ok(AccessRequired::Unsatisfiable),
+            Ok(ProtoAccessRequired::Unknown) => Ok(AccessRequired::Unknown),
+            Ok(ProtoAccessRequired::Any) => Ok(AccessRequired::Any),
+            Ok(ProtoAccessRequired::Member) => Ok(AccessRequired::Member),
+            Ok(ProtoAccessRequired::Administrator) => {
+                Ok(AccessRequired::Administrator)
+            },
+            Ok(ProtoAccessRequired::Unsatisfiable) => {
+                Ok(AccessRequired::Unsatisfiable)
+            },
             Err(_e) => Err(GroupDecodingError::WrongEnumValue),
         }
     }
@@ -258,6 +293,7 @@ impl TryFrom<crate::proto::AccessControl> for AccessControl {
             attributes: value.attributes.try_into()?,
             members: value.members.try_into()?,
             add_from_invite_link: value.add_from_invite_link.try_into()?,
+            member_label: value.member_label.try_into()?,
         })
     }
 }

@@ -77,6 +77,20 @@ impl<C: WebSocketType> SignalWebSocket<C> {
 }
 
 impl<C: WebSocketType> WebSocketRequestBuilder<'_, C> {
+    pub(crate) fn registration_auth_header(
+        mut self,
+        phonenumber: libsignal_core::E164,
+        password: &str,
+    ) -> Self {
+        use base64::engine::{general_purpose::STANDARD, Engine};
+        let encoded =
+            STANDARD.encode(format!("{phonenumber}:{password}").as_bytes());
+        self.message_builder = self
+            .message_builder
+            .header("Authorization", format!("Basic {encoded}"));
+        self
+    }
+
     pub(crate) async fn send_json<B: Serialize>(
         self,
         value: B,

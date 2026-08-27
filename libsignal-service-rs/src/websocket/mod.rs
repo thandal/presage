@@ -120,10 +120,10 @@ struct SignalWebSocketProcess {
 impl SignalWebSocketProcess {
     async fn process_frame(
         &mut self,
-        frame: Vec<u8>,
+        frame: Bytes,
     ) -> Result<(), ServiceError> {
         use prost::Message;
-        let msg = WebSocketMessage::decode(Bytes::from(frame))?;
+        let msg = WebSocketMessage::decode(frame)?;
         if let Some(request) = &msg.request {
             tracing::trace!(
                 msg_type =? msg.r#type(),
@@ -182,14 +182,24 @@ impl SignalWebSocketProcess {
                     } else if let Some(_x) =
                         self.outgoing_keep_alive_set.take(&id)
                     {
-                        let status_code = response.status();
-                        if status_code != 200 {
+                        let status = reqwest::StatusCode::from_u16(
+                            response.status() as _,
+                        )
+                        .map_err(|e| {
+                            ServiceError::IO(std::io::Error::other(format!(
+                                "invalid http status code {} - {e}",
+                                response.status()
+                            )))
+                        })?;
+                        if !status.is_success() {
                             tracing::warn!(
-                                status_code,
-                                "response code for keep-alive != 200"
+                                %status,
+                                "response code for keep-alive not successful"
                             );
                             return Err(ServiceError::UnhandledResponseCode {
-                                http_code: response.status() as u16,
+                                status,
+                                body: String::from_utf8_lossy(response.body())
+                                    .into_owned(),
                             });
                         }
                     } else {
@@ -249,7 +259,7 @@ impl SignalWebSocketProcess {
                         ..Default::default()
                     };
                     let buffer = msg.encode_to_vec();
-                    if let Err(e) = self.ws.send(reqwest_websocket::Message::Binary(buffer)).await {
+                    if let Err(e) = self.ws.send(reqwest_websocket::Message::Binary(buffer.into())).await {
                         tracing::info!("Websocket sink has closed: {:?}.", e);
                         break;
                     };
@@ -283,7 +293,7 @@ impl SignalWebSocketProcess {
                                 ..Default::default()
                             };
                             let buffer = msg.encode_to_vec();
-                            self.ws.send(reqwest_websocket::Message::Binary(buffer)).await?
+                            self.ws.send(reqwest_websocket::Message::Binary(buffer.into())).await?
                         }
                         None => {
                             debug!("end of application request stream; websocket closing");

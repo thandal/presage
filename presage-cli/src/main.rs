@@ -123,6 +123,17 @@ enum Cmd {
         #[clap(long, value_parser = parse_base64_profile_key)]
         profile_key: Option<ProfileKey>,
     },
+    #[clap(about = "Update the user's profile name and privacy settings")]
+    UpdateProfile {
+        #[clap(long, help = "The given (first) name of the profile")]
+        given_name: Option<String>,
+        #[clap(long, help = "The family (last) name of the profile")]
+        family_name: Option<String>,
+        #[clap(long, help = "The 'about' text of the profile")]
+        about: Option<String>,
+        #[clap(long, help = "The 'emoji' of the profile")]
+        emoji: Option<String>,
+    },
     #[clap(about = "Receive all pending messages and saves them to disk")]
     Sync {
         #[clap(long = "notifications", short = 'n')]
@@ -221,17 +232,6 @@ enum Cmd {
     },
     #[clap(about = "Retrieve own profile (name/about/emoji) and print as JSON")]
     RetrieveProfileSelf,
-    #[clap(about = "Update the user's profile display name, about text, and emoji")]
-    UpdateProfile {
-        #[clap(long, help = "The given (first) name of the profile")]
-        given_name: Option<String>,
-        #[clap(long, help = "The family (last) name of the profile")]
-        family_name: Option<String>,
-        #[clap(long, help = "The 'about' text of the profile")]
-        about: Option<String>,
-        #[clap(long, help = "The 'emoji' of the profile")]
-        emoji: Option<String>,
-    },
     #[cfg(feature = "extras")]
     #[clap(about = "Print various statistics useful for debugging")]
     Stats,
@@ -563,6 +563,10 @@ async fn print_message<S: Store>(
         ContentBody::PniSignatureMessage(_) => {
             Some(Msg::Received(&thread, "got PNI signature message".into()))
         }
+        ContentBody::DecryptionErrorMessage(_) => Some(Msg::Received(
+            &thread,
+            "failed to decrypt a messagee".into(),
+        )),
     } {
         let ts = content.timestamp();
         let (prefix, body) = match msg {
@@ -659,6 +663,9 @@ async fn receive<S: Store>(
                     }
                 }
             }
+            Received::DecryptionError(c) => {
+                println!("failed to receive a message from a contact: {c:?}")
+            }
         }
     }
 
@@ -691,7 +698,7 @@ async fn run<S: Store>(subcommand: Cmd, store: S) -> anyhow::Result<()> {
             let stdin = io::stdin();
             let reader = BufReader::new(stdin);
             if let Some(confirmation_code) = reader.lines().next_line().await? {
-                let registered_manager =
+                let registered_manager: Manager<S, Registered> =
                     manager.confirm_verification_code(confirmation_code).await?;
                 println!(
                     "Account identifiers: {}",
@@ -971,7 +978,7 @@ async fn run<S: Store>(subcommand: Cmd, store: S) -> anyhow::Result<()> {
         }
         Cmd::Whoami => {
             let manager = load_registered_and_receive(store).await?;
-            println!("{:?}", &manager.whoami().await?);
+            println!("{:?}", manager.whoami().await?);
         }
         #[cfg(feature = "extras")]
         Cmd::GetContact { ref id } => {
@@ -1018,6 +1025,9 @@ async fn run<S: Store>(subcommand: Cmd, store: S) -> anyhow::Result<()> {
                     Received::QueueEmpty => break,
                     Received::Contacts => println!("got contacts! thank you, come again."),
                     Received::Content(_) => print!("."),
+                    Received::DecryptionError(_) => {
+                        println!("failed to receive a message from a contact")
+                    }
                 }
             }
         }

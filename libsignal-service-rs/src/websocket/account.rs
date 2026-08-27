@@ -8,7 +8,7 @@ use crate::{
     proto::DeviceName,
     utils::{
         serde_device_id, serde_e164, serde_optional_base64,
-        serde_optional_prost_base64,
+        serde_optional_base64_url_safe_no_pad, serde_optional_prost_base64,
     },
     websocket,
 };
@@ -51,19 +51,21 @@ pub(crate) struct DeviceInfoEncrypted {
 #[serde(rename_all = "camelCase")]
 /// kept in sync with https://github.com/signalapp/Signal-Server/blob/main/service/src/main/java/org/whispersystems/textsecuregcm/entities/AccountAttributes.java#L25
 pub struct AccountAttributes {
-    pub fetches_messages: bool,
     pub registration_id: u32,
-    pub pni_registration_id: u32,
-    #[serde(default, with = "serde_optional_prost_base64")]
-    pub name: Option<DeviceName>,
+    pub voice: bool,
+    pub video: bool,
+    pub fetches_messages: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub registration_lock: Option<String>,
     #[serde(default, with = "serde_optional_base64")]
     pub unidentified_access_key: Option<Vec<u8>>,
     pub unrestricted_unidentified_access: bool,
-    pub capabilities: DeviceCapabilities,
     pub discoverable_by_phone_number: bool,
-    pub pin: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capabilities: Option<DeviceCapabilities>,
+    #[serde(default, with = "serde_optional_prost_base64")]
+    pub name: Option<DeviceName>,
+    pub pni_registration_id: u32,
     #[serde(
         default,
         with = "serde_optional_base64",
@@ -72,6 +74,8 @@ pub struct AccountAttributes {
     pub recovery_password: Option<Vec<u8>>,
 }
 
+// Keep in sync with https://github.com/signalapp/Signal-Server/blob/main/service/src/main/java/org/whispersystems/textsecuregcm/storage/DeviceCapability.java.
+// When updating this, also consider updating LinkCapabilities.
 #[derive(Debug, Serialize, Deserialize, Eq, PartialEq, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct DeviceCapabilities {
@@ -83,6 +87,11 @@ pub struct DeviceCapabilities {
     pub attachment_backfill: bool,
     #[serde(default)]
     pub spqr: bool,
+    // For some reason, this uses snake case while everything else uses camel case.
+    #[serde(default, rename = "profiles_v2")]
+    pub profiles_v2: bool,
+    #[serde(default)]
+    pub username_change_sync_message: bool,
 }
 
 impl Default for DeviceCapabilities {
@@ -92,7 +101,21 @@ impl Default for DeviceCapabilities {
             transfer: false,
             attachment_backfill: false,
             spqr: true,
+            profiles_v2: false,
+            username_change_sync_message: false,
         }
+    }
+}
+
+#[cfg(test)]
+mod test {
+    #[test]
+    fn device_capabilities_serialization_weird_casing() {
+        let capabilities = super::DeviceCapabilities::default();
+        let json = serde_json::to_string(&capabilities)
+            .expect("Serialize capabilities");
+        assert!(json.contains("usernameChangeSyncMessage"));
+        assert!(json.contains("profiles_v2"));
     }
 }
 
@@ -105,6 +128,15 @@ pub struct WhoAmIResponse {
     pub pni: Uuid,
     #[serde(with = "serde_e164")]
     pub number: libsignal_core::E164,
+    /// Hash of the account's username, if one is set.
+    #[serde(default, with = "serde_optional_base64_url_safe_no_pad")]
+    pub username_hash: Option<Vec<u8>>,
+    /// Handle (UUID) of the account's username link, if one is set.
+    ///
+    /// Decrypting the username also requires the link entropy, which the
+    /// server never sees; only the full `signal.me` link carries it.
+    #[serde(default)]
+    pub username_link_handle: Option<Uuid>,
 }
 
 impl SignalWebSocket<websocket::Identified> {
@@ -146,11 +178,6 @@ impl SignalWebSocket<websocket::Identified> {
         &mut self,
         attributes: AccountAttributes,
     ) -> Result<(), ServiceError> {
-        assert!(
-            attributes.pin.is_none() || attributes.registration_lock.is_none(),
-            "only one of PIN and registration lock can be set."
-        );
-
         self.http_request(Method::PUT, "/v1/accounts/attributes")?
             .send_json(&attributes)
             .await?

@@ -1,8 +1,6 @@
-use std::sync::Arc;
-
 use libsignal_service::configuration::SignalServers;
 use libsignal_service::prelude::phonenumber::PhoneNumber;
-use libsignal_service::prelude::PushService;
+use libsignal_service::push_service::PushService;
 use libsignal_service::websocket::registration::VerificationTransport;
 use rand::distr::{Alphanumeric, SampleString};
 use tracing::trace;
@@ -31,6 +29,8 @@ impl<S: Store> Manager<S, Registration> {
     /// The returned value is a [confirmation manager](Manager::confirm_verification_code) which you then
     /// have to use to send the confirmation code.
     ///
+    /// You will need to fill out a captcha and give it via [RegistrationOptions]; for production servers this can be done at [this website](https://signalcaptchas.org/registration/generate.html), for staging servers on [this website](https://signalcaptchas.org/staging/registration/generate)
+    ///
     /// ```no_run
     /// use std::str::FromStr;
     ///
@@ -53,7 +53,7 @@ impl<S: Store> Manager<S, Registration> {
     ///             signal_servers: SignalServers::Production,
     ///             phone_number: PhoneNumber::from_str("+16137827274")?,
     ///             use_voice_call: false,
-    ///             captcha: None,
+    ///             captcha: Some("signalcaptcha://..."),
     ///             force: false,
     ///         },
     ///     )
@@ -70,9 +70,15 @@ impl<S: Store> Manager<S, Registration> {
             signal_servers,
             phone_number,
             use_voice_call,
-            captcha,
+            mut captcha,
             force,
         } = registration_options;
+
+        if let Some(c) = captcha {
+            let no_prefix = c.strip_prefix("signalcaptcha://").unwrap_or(c);
+            let no_suffix = no_prefix.strip_suffix('/').unwrap_or(no_prefix);
+            captcha = Some(no_suffix);
+        }
 
         // check if we are already registered
         if !force && store.is_registered().await {
@@ -85,12 +91,16 @@ impl<S: Store> Manager<S, Registration> {
         let mut rng = rand::rng();
         let password = Alphanumeric.sample_string(&mut rng, 24);
 
-        let push_service = PushService::new(signal_servers, None, crate::USER_AGENT);
+        let mut unidentified_push_service =
+            PushService::new(signal_servers, None, crate::USER_AGENT);
+        let mut unidentified_websocket = unidentified_push_service
+            .ws("/v1/websocket/", "/v1/keepalive", &[], None)
+            .await?;
 
         trace!("creating registration verification session");
 
         let phone_number_string = phone_number.to_string();
-        let mut session = push_service
+        let mut session = unidentified_websocket
             .create_verification_session(&phone_number_string, None, None, None)
             .await?;
 
@@ -100,7 +110,7 @@ impl<S: Store> Manager<S, Registration> {
                 if captcha.is_none() {
                     return Err(Error::CaptchaRequired);
                 }
-                session = push_service
+                session = unidentified_websocket
                     .patch_verification_session(&session.id, None, None, None, captcha, None)
                     .await?
             }
@@ -115,7 +125,7 @@ impl<S: Store> Manager<S, Registration> {
 
         trace!("requesting verification code");
 
-        session = push_service
+        session = unidentified_websocket
             .request_verification_code(
                 &session.id,
                 crate::USER_AGENT,
@@ -129,12 +139,13 @@ impl<S: Store> Manager<S, Registration> {
 
         let manager = Manager {
             store,
-            state: Arc::new(Confirmation {
+            state: Confirmation {
                 signal_servers,
                 phone_number,
                 password,
                 session_id: session.id,
-            }),
+                unidentified_websocket,
+            },
         };
 
         Ok(manager)

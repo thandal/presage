@@ -17,13 +17,10 @@ exclude = ["libsignal-service-rs"]
 resolver = "2"
 
 [patch.crates-io]
-curve25519-dalek = { git = 'https://github.com/signalapp/curve25519-dalek', tag = 'signal-curve25519-4.1.3' }
 quickcheck_async = { git = 'https://github.com/nytopop/quickcheck_async', rev = '76b13525ca93e0725e757f841fc6ccab8bae1913' }
 libsqlite3-sys = { version = "0.36.0", git = "https://github.com/whisperfish/rusqlite", rev = '2a42b3354c9194700d08aa070f70a131a470e7dc' }
 
-# libsignal-service is vendored in libsignal-service-rs/ so this repo captures a
-# fully buildable state. It is based on thandal/libsignal-service-rs @ 4a837c2
-# (REST registration path used by presage-cli), plus the PNI binary-service-id
-# fixes in src/cipher.rs / src/envelope.rs. Not intended for upstream submission.
+# Keep the upstream library revision vendored so the serverless build is
+# reproducible, with the two retry-receipt helpers used by presage below.
 [patch."https://github.com/whisperfish/libsignal-service-rs"]
 libsignal-service = { path = "libsignal-service-rs" }

@@ -1,6 +1,6 @@
 use std::{convert::TryFrom, fmt, time::SystemTime};
 
-use aes::cipher::block_padding::{Iso7816, RawPadding};
+use aes::cipher::block_padding::{Iso7816, Padding};
 use base64::prelude::*;
 use libsignal_core::ServiceIdKind;
 use libsignal_protocol::{
@@ -8,10 +8,12 @@ use libsignal_protocol::{
     message_encrypt, process_sender_key_distribution_message,
     sealed_sender_decrypt_to_usmc, sealed_sender_encrypt,
     CiphertextMessageType, DeviceId, IdentityKeyStore, KyberPreKeyStore,
-    PreKeySignalMessage, PreKeyStore, ProtocolAddress, ProtocolStore,
-    PublicKey, SealedSenderDecryptionResult, SenderCertificate,
-    SenderKeyDistributionMessage, SenderKeyStore, ServiceId, SessionStore,
-    SignalMessage, SignalProtocolError, SignedPreKeyStore, Timestamp,
+    PlaintextContent, PreKeySignalMessage, PreKeyStore, ProtocolAddress,
+    ProtocolStore, PublicKey, SealedSenderDecryptionResult, SenderCertificate,
+    SenderKeyDistributionMessage, SenderKeyStore, ServiceId, SessionNotFound,
+    SessionStore, SessionUsabilityRequirements, SignalMessage,
+    SignalProtocolError, SignedPreKeyStore, Timestamp,
+    UnidentifiedSenderMessageContent,
 };
 use prost::Message;
 use rand::{rng, CryptoRng, Rng};
@@ -34,8 +36,7 @@ use crate::{
 pub struct ServiceCipher<S> {
     protocol_store: S,
     trust_roots: Vec<PublicKey>,
-    local_uuid: Uuid,
-    local_device_id: DeviceId,
+    local_address: ProtocolAddress,
 }
 
 impl<S> fmt::Debug for ServiceCipher<S> {
@@ -43,8 +44,7 @@ impl<S> fmt::Debug for ServiceCipher<S> {
         f.debug_struct("ServiceCipher")
             .field("protocol_store", &"...")
             .field("trust_root", &"...")
-            .field("local_uuid", &self.local_uuid)
-            .field("local_device_id", &self.local_device_id)
+            .field("local_address", &self.local_address)
             .finish()
     }
 }
@@ -61,7 +61,7 @@ fn debug_envelope(envelope: &Envelope) -> String {
                  timestamp: {:?}, \
                  content: {} bytes, \
              }}",
-            envelope.source_service_id,
+            envelope.parse_source_service_id(),
             envelope.source_device(),
             envelope.server_guid(),
             envelope.timestamp(),
@@ -77,14 +77,12 @@ where
     pub fn new(
         protocol_store: S,
         trust_roots: Vec<PublicKey>,
-        local_uuid: Uuid,
-        local_device_id: DeviceId,
+        local_address: ProtocolAddress,
     ) -> Self {
         Self {
             protocol_store,
             trust_roots,
-            local_uuid,
-            local_device_id,
+            local_address,
         }
     }
 
@@ -97,6 +95,10 @@ where
         envelope: Envelope,
         csprng: &mut R,
     ) -> Result<Option<Content>, ServiceError> {
+        let local_service: ServiceId =
+            ServiceId::parse_from_service_id_string(self.local_address.name())
+                .expect("valid protocol address name");
+
         if envelope.content.is_some() {
             let plaintext = self.decrypt(&envelope, csprng).await?;
             let was_plaintext = plaintext.metadata.was_plaintext;
@@ -138,14 +140,15 @@ where
             }
 
             if message.sync_message.is_some()
-                && plaintext.metadata.sender.aci().map(Into::into)
-                    != Some(self.local_uuid)
+                && plaintext.metadata.sender.aci().map(Uuid::from)
+                    != Some(local_service.raw_uuid())
+                && local_service.kind() == ServiceIdKind::Aci
             {
                 tracing::warn!("Source is not ourself.");
                 return Ok(None);
             }
 
-            if let Some(bytes) = message.sender_key_distribution_message {
+            if let Some(bytes) = &message.sender_key_distribution_message {
                 let skdm = SenderKeyDistributionMessage::try_from(&bytes[..])?;
                 process_sender_key_distribution_message(
                     &plaintext.metadata.protocol_address()?,
@@ -153,34 +156,35 @@ where
                     &mut self.protocol_store,
                 )
                 .await?;
-                Ok(None)
-            } else {
-                let content = Content::from_proto(message, plaintext.metadata)?;
-                Ok(Some(content))
+
+                match Content::from_proto(message, plaintext.metadata) {
+                    Err(ServiceError::UnsupportedContent) => {
+                        tracing::trace!("Sender key distribution message without additional content");
+                        return Ok(None);
+                    },
+                    content => return Ok(Some(content?)),
+                }
             }
+            let content = Content::from_proto(message, plaintext.metadata);
+            Ok(Some(content?))
         } else {
             Ok(None)
         }
     }
 
-    /// Unwraps the outer sealed-sender layer of an `UnidentifiedSender`
-    /// envelope without decrypting the inner message. Returns the
-    /// `(sender, device_id, inner msg type, inner ciphertext)` tuple. Useful
-    /// on the decrypt-failure path: when the inner Whisper/PreKey decrypt
-    /// fails (typically a stale session), this lets the caller still construct
-    /// a DecryptionErrorMessage targeted at the right sender, since the
-    /// outer envelope's `source_service_id` is intentionally absent for
-    /// sealed sender.
+    /// Unwraps the outer sealed-sender layer without decrypting the inner
+    /// message, allowing callers to construct a retry receipt after an inner
+    /// session decrypt fails.
     pub async fn peek_unidentified_sender(
         &mut self,
         ciphertext: &[u8],
-    ) -> Result<(ServiceId, DeviceId, CiphertextMessageType, Vec<u8>), SignalProtocolError>
-    {
-        let usmc = sealed_sender_decrypt_to_usmc(
-            ciphertext,
-            &mut self.protocol_store,
-        )
-        .await?;
+    ) -> Result<
+        (ServiceId, DeviceId, CiphertextMessageType, Vec<u8>),
+        SignalProtocolError,
+    > {
+        let usmc =
+            sealed_sender_decrypt_to_usmc(ciphertext, &mut self.protocol_store)
+                .await?;
         let sender_uuid = usmc.sender()?.sender_uuid()?;
         let sender = ServiceId::parse_from_service_id_string(sender_uuid)
             .ok_or_else(|| {
@@ -205,6 +209,10 @@ where
         envelope: &Envelope,
         csprng: &mut R,
     ) -> Result<Plaintext, ServiceError> {
+        let local_service: ServiceId =
+            ServiceId::parse_from_service_id_string(self.local_address.name())
+                .expect("valid protocol address name");
+
         let ciphertext = if let Some(msg) = envelope.content.as_ref() {
             msg
         } else {
@@ -227,7 +235,7 @@ where
             });
         };
 
-        if destination_service_id.raw_uuid() != self.local_uuid {
+        if destination_service_id != local_service {
             tracing::warn!(
                 "mismatching destination service id; ignoring invalid message."
             );
@@ -236,8 +244,10 @@ where
             });
         }
 
+        let source_service_id = envelope.parse_source_service_id();
+
         if destination_service_id.kind() == ServiceIdKind::Pni
-            && envelope.parse_source_service_id().is_none()
+            && source_service_id.is_none()
         {
             tracing::warn!("received sealed sender message to our PNI; ignoring invalid message");
             return Err(ServiceError::InvalidFrame {
@@ -246,7 +256,7 @@ where
         }
 
         // TODO: let chain in edition 2024
-        if let Some(source_service_id) = envelope.parse_source_service_id() {
+        if let Some(source_service_id) = source_service_id {
             if source_service_id.kind() == ServiceIdKind::Pni
                 && envelope.r#type() != Type::ServerDeliveryReceipt
             {
@@ -257,14 +267,30 @@ where
             }
         }
 
+        // Extract both kinds of timestamps.
+        // Note that we do not `?` here, but rather only later, in case we ever have a branch which
+        // is not concerned with envelope metadata.
+        let timestamp = chrono::DateTime::from_timestamp_millis(
+            envelope.timestamp() as i64,
+        )
+        .ok_or(ServiceError::InvalidFrame {
+            reason: "unparseable timestamp",
+        });
+        let server_timestamp = chrono::DateTime::from_timestamp_millis(
+            envelope.server_timestamp() as i64,
+        )
+        .ok_or(ServiceError::InvalidFrame {
+            reason: "unparseable server timestamp",
+        });
+
         use crate::proto::envelope::Type;
         let plaintext = match envelope.r#type() {
             Type::PrekeyBundle => {
+                let source_service_id = source_service_id
+                    .expect("prekey bundle format contains source_service_id");
                 let sender = get_preferred_protocol_address(
                     &self.protocol_store,
-                    &envelope
-                        .parse_source_service_id()
-                        .expect("prekey bundle format"),
+                    &source_service_id,
                     envelope.source_device().try_into()?,
                 )
                 .await?;
@@ -272,11 +298,10 @@ where
                     destination: envelope
                         .parse_destination_service_id()
                         .expect("prekey bundle format"),
-                    sender: envelope
-                        .parse_source_service_id()
-                        .expect("prekey bundle format"),
+                    sender: source_service_id,
                     sender_device: envelope.source_device().try_into()?,
-                    timestamp: envelope.server_timestamp(),
+                    timestamp: timestamp?,
+                    server_timestamp: server_timestamp?,
                     needs_receipt: false,
                     unidentified_sender: false,
                     was_plaintext: false,
@@ -285,8 +310,9 @@ where
                 };
 
                 let mut data = message_decrypt_prekey(
-                    &PreKeySignalMessage::try_from(&ciphertext[..]).unwrap(),
+                    &PreKeySignalMessage::try_from(&ciphertext[..])?,
                     &sender,
+                    &self.local_address,
                     &mut self.protocol_store.clone(),
                     &mut self.protocol_store.clone(),
                     &mut self.protocol_store.clone(),
@@ -302,7 +328,11 @@ where
                     .protocol_store
                     .load_session(&sender)
                     .await?
-                    .ok_or(SignalProtocolError::SessionNotFound(sender))?;
+                    .ok_or_else(|| {
+                        SignalProtocolError::SessionNotFound(
+                            SessionNotFound::new(sender, "decrypt"),
+                        )
+                    })?;
 
                 strip_padding_version(
                     session_record.session_version()?,
@@ -312,32 +342,36 @@ where
             },
             Type::PlaintextContent => {
                 tracing::warn!(?envelope, "Envelope with plaintext content.  This usually indicates a decryption retry.");
+                let source_service_id = source_service_id
+                    .expect("prekey bundle format contains source_service_id");
                 let metadata = Metadata {
                     destination: envelope
                         .parse_destination_service_id()
                         .expect("plaintext content format"),
-                    sender: envelope
-                        .parse_source_service_id()
-                        .expect("plaintext content format"),
+                    sender: source_service_id,
                     sender_device: envelope.source_device().try_into()?,
-                    timestamp: envelope.server_timestamp(),
+                    timestamp: timestamp?,
+                    server_timestamp: server_timestamp?,
                     needs_receipt: false,
                     unidentified_sender: false,
                     was_plaintext: true,
 
                     server_guid,
                 };
-                Plaintext {
-                    metadata,
-                    data: ciphertext.clone(),
-                }
+                // Unsealed envelope wrapping a PlaintextContent.
+                // Should contain a DecryptionErrorMessage.
+                let plaintext_content =
+                    PlaintextContent::try_from(&ciphertext[..])?;
+                let mut data = plaintext_content.body().to_vec();
+                strip_padding(&mut data)?;
+                Plaintext { metadata, data }
             },
             Type::Ciphertext => {
+                let source_service_id = source_service_id
+                    .expect("prekey bundle format contains source_service_id");
                 let sender = get_preferred_protocol_address(
                     &self.protocol_store,
-                    &envelope
-                        .parse_source_service_id()
-                        .expect("ciphertext envelope format"),
+                    &source_service_id,
                     envelope.source_device().try_into()?,
                 )
                 .await?;
@@ -349,7 +383,8 @@ where
                         .parse_source_service_id()
                         .expect("ciphertext envelope format"),
                     sender_device: envelope.source_device().try_into()?,
-                    timestamp: envelope.timestamp(),
+                    timestamp: timestamp?,
+                    server_timestamp: server_timestamp?,
                     needs_receipt: false,
                     unidentified_sender: false,
                     was_plaintext: false,
@@ -360,6 +395,7 @@ where
                 let mut data = message_decrypt_signal(
                     &SignalMessage::try_from(&ciphertext[..])?,
                     &sender,
+                    &self.local_address,
                     &mut self.protocol_store.clone(),
                     &mut self.protocol_store.clone(),
                     csprng,
@@ -372,7 +408,11 @@ where
                     .protocol_store
                     .load_session(&sender)
                     .await?
-                    .ok_or(SignalProtocolError::SessionNotFound(sender))?;
+                    .ok_or_else(|| {
+                        SignalProtocolError::SessionNotFound(
+                            SessionNotFound::new(sender, "decrypt"),
+                        )
+                    })?;
 
                 strip_padding_version(
                     session_record.session_version()?,
@@ -391,8 +431,7 @@ where
                     &self.trust_roots,
                     Timestamp::from_epoch_millis(envelope.timestamp()),
                     None,
-                    self.local_uuid.to_string(),
-                    self.local_device_id,
+                    self.local_address.clone(),
                     &mut self.protocol_store.clone(),
                     &mut self.protocol_store.clone(),
                     &mut self.protocol_store.clone(),
@@ -413,8 +452,7 @@ where
                     );
                 };
 
-                let needs_receipt = if envelope.parse_source_service_id().is_some()
-                {
+                let needs_receipt = if source_service_id.is_some() {
                     tracing::warn!(?envelope, "Received an unidentified delivery over an identified channel.  Marking needs_receipt=false");
                     false
                 } else {
@@ -436,7 +474,8 @@ where
                         .expect("unidentified sender envelope format"),
                     sender,
                     sender_device: device_id,
-                    timestamp: envelope.timestamp(),
+                    timestamp: timestamp?,
+                    server_timestamp: server_timestamp?,
                     unidentified_sender: true,
                     needs_receipt,
                     was_plaintext: false,
@@ -483,8 +522,24 @@ where
             .load_session(address)
             .await?
             .ok_or_else(|| {
-            SignalProtocolError::SessionNotFound(address.clone())
+            SignalProtocolError::SessionNotFound(SessionNotFound::new(
+                address.clone(),
+                "encrypt",
+            ))
         })?;
+
+        let record_usable = session_record
+            .has_usable_sender_chain(
+                SystemTime::now(),
+                SessionUsabilityRequirements::NotStale,
+            )
+            .unwrap_or(false);
+        if !record_usable {
+            Err(SignalProtocolError::SessionNotFound(SessionNotFound::new(
+                address.clone(),
+                "encrypt",
+            )))?;
+        }
 
         let padded_content =
             add_padding(session_record.session_version()?, content)?;
@@ -515,6 +570,7 @@ where
             let message = message_encrypt(
                 &padded_content,
                 address,
+                &self.local_address,
                 &mut self.protocol_store.clone(),
                 &mut self.protocol_store.clone(),
                 SystemTime::now(),
@@ -608,6 +664,36 @@ pub async fn get_preferred_protocol_address<S: SessionStore>(
     Ok(address)
 }
 
+/// Error thrown when the sealed sending decryption fails.
+///
+/// The USMC sender field is only populated when the USMC could be validated against the trust roots;
+/// hence the sender information can be trusted, give or take an active attacker on the Signal
+/// side.
+#[derive(thiserror::Error)]
+#[error("error: {inner}, usmc: {}", sender.is_some())]
+pub struct SealedSenderDecryptionError {
+    pub inner: SignalProtocolError,
+    pub sender: Option<ProtocolAddress>,
+}
+
+impl fmt::Debug for SealedSenderDecryptionError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SealedSenderDecryptionError")
+            .field("inner", &self.inner)
+            .field("sender", &self.sender)
+            .finish()
+    }
+}
+
+impl From<SignalProtocolError> for SealedSenderDecryptionError {
+    fn from(e: SignalProtocolError) -> Self {
+        SealedSenderDecryptionError {
+            inner: e,
+            sender: None,
+        }
+    }
+}
+
 /// Decrypt a Sealed Sender message `ciphertext` in either the v1 or v2 format, validate its sender
 /// certificate, and then decrypt the inner message payload.
 ///
@@ -636,15 +722,14 @@ async fn sealed_sender_decrypt(
     trust_roots: &[PublicKey],
     timestamp: Timestamp,
     local_e164: Option<String>,
-    local_uuid: String,
-    local_device_id: DeviceId,
+    local_address: ProtocolAddress,
     identity_store: &mut dyn IdentityKeyStore,
     session_store: &mut dyn SessionStore,
     pre_key_store: &mut dyn PreKeyStore,
     signed_pre_key_store: &mut dyn SignedPreKeyStore,
     sender_key_store: &mut dyn SenderKeyStore,
     kyber_pre_key_store: &mut dyn KyberPreKeyStore,
-) -> Result<SealedSenderDecryptionResult, SignalProtocolError> {
+) -> Result<SealedSenderDecryptionResult, SealedSenderDecryptionError> {
     let usmc =
         sealed_sender_decrypt_to_usmc(ciphertext, identity_store).await?;
 
@@ -654,10 +739,20 @@ async fn sealed_sender_decrypt(
     {
         return Err(SignalProtocolError::InvalidSealedSenderMessage(
             "trust root validation failed".to_string(),
-        ));
+        )
+        .into());
     }
 
-    let is_local_uuid = local_uuid == usmc.sender()?.sender_uuid()?;
+    let local_service_id =
+        ServiceId::parse_from_service_id_string(local_address.name())
+            .expect("valid protocol address name");
+    let is_local_uuid = local_service_id.raw_uuid()
+        == usmc
+            .sender()?
+            .sender_uuid()?
+            .parse::<Uuid>()
+            // Validity checked inside certificate checker
+            .expect("valid uuid");
 
     let is_local_e164 = match (local_e164, usmc.sender()?.sender_e164()?) {
         (Some(l), Some(s)) => l == s,
@@ -665,24 +760,55 @@ async fn sealed_sender_decrypt(
     };
 
     if (is_local_e164 || is_local_uuid)
-        && usmc.sender()?.sender_device_id()? == local_device_id
+        && usmc.sender()?.sender_device_id()? == local_address.device_id()
     {
-        return Err(SignalProtocolError::SealedSenderSelfSend);
+        return Err(SignalProtocolError::SealedSenderSelfSend.into());
     }
-
-    let mut rng = rng();
 
     let remote_address = ProtocolAddress::new(
         usmc.sender()?.sender_uuid()?.to_string(),
         usmc.sender()?.sender_device_id()?,
     );
 
+    sealed_sender_decrypt_with_validated_usmc(
+        &usmc,
+        &remote_address,
+        &local_address,
+        identity_store,
+        session_store,
+        pre_key_store,
+        signed_pre_key_store,
+        sender_key_store,
+        kyber_pre_key_store,
+    )
+    .await
+    .map_err(|inner| SealedSenderDecryptionError {
+        inner,
+        sender: Some(remote_address),
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn sealed_sender_decrypt_with_validated_usmc(
+    usmc: &UnidentifiedSenderMessageContent,
+    remote_address: &ProtocolAddress,
+    local_address: &ProtocolAddress,
+    identity_store: &mut dyn IdentityKeyStore,
+    session_store: &mut dyn SessionStore,
+    pre_key_store: &mut dyn PreKeyStore,
+    signed_pre_key_store: &mut dyn SignedPreKeyStore,
+    sender_key_store: &mut dyn SenderKeyStore,
+    kyber_pre_key_store: &mut dyn KyberPreKeyStore,
+) -> Result<SealedSenderDecryptionResult, SignalProtocolError> {
+    let mut rng = rng();
+
     let message = match usmc.msg_type()? {
         CiphertextMessageType::Whisper => {
             let ctext = SignalMessage::try_from(usmc.contents()?)?;
             message_decrypt_signal(
                 &ctext,
-                &remote_address,
+                remote_address,
+                local_address,
                 session_store,
                 identity_store,
                 &mut rng,
@@ -693,7 +819,8 @@ async fn sealed_sender_decrypt(
             let ctext = PreKeySignalMessage::try_from(usmc.contents()?)?;
             message_decrypt_prekey(
                 &ctext,
-                &remote_address,
+                remote_address,
+                local_address,
                 session_store,
                 identity_store,
                 pre_key_store,
@@ -704,14 +831,15 @@ async fn sealed_sender_decrypt(
             .await?
         },
         CiphertextMessageType::SenderKey => {
-            group_decrypt(usmc.contents()?, sender_key_store, &remote_address)
+            group_decrypt(usmc.contents()?, sender_key_store, remote_address)
                 .await?
         },
-        msg_type => {
-            return Err(SignalProtocolError::InvalidMessage(
-                msg_type,
-                "unexpected message type for sealed_sender_decrypt",
-            ));
+        CiphertextMessageType::Plaintext => {
+            // Sealed sender envelope wrapping a PlaintextContent.
+            // Should contain a DecryptionErrorMessage.
+            let plaintext_content =
+                PlaintextContent::try_from(usmc.contents()?)?;
+            plaintext_content.body().to_vec()
         },
     };
 

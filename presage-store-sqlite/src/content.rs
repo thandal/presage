@@ -145,6 +145,7 @@ impl ContentsStore for SqliteStore {
             unidentified_sender,
             server_guid: _,
             was_plaintext,
+            server_timestamp: _,
         } = metadata;
 
         let sender_device: u8 = sender_device.into();
@@ -152,9 +153,7 @@ impl ContentsStore for SqliteStore {
         let destination_service_id = destination.service_id_string();
 
         let proto_bytes = prost::Message::encode_to_vec(&body.into_proto());
-        let timestamp: i64 = timestamp
-            .try_into()
-            .map_err(|_| SqliteStoreError::InvalidFormat)?;
+        let timestamp = timestamp.timestamp_millis();
 
         query!(
             "INSERT OR REPLACE INTO thread_messages (
@@ -221,6 +220,7 @@ impl ContentsStore for SqliteStore {
             SqlMessage,
             r#"SELECT
                 ts AS "ts: _",
+                server_ts AS "server_ts: _",
                 sender_service_id,
                 sender_device_id AS "sender_device_id: _",
                 destination_service_id,
@@ -254,6 +254,7 @@ impl ContentsStore for SqliteStore {
             SqlMessage,
             r#"SELECT
                 ts AS "ts: _",
+                server_ts AS "server_ts: _",
                 sender_service_id,
                 sender_device_id AS "sender_device_id: _",
                 destination_service_id,
@@ -423,7 +424,7 @@ impl ContentsStore for SqliteStore {
         // `groups` table picked up extra columns from migrations we don't
         // ship (e.g. uploads from a fork). SQLite leaves unlisted columns at
         // their DEFAULT / NULL.
-        query!(
+        sqlx::query(
             "INSERT OR REPLACE INTO groups (
                 master_key,
                 title,
@@ -434,19 +435,21 @@ impl ContentsStore for SqliteStore {
                 description,
                 members,
                 pending_members,
-                requesting_members
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            master_key,
-            g.title,
-            g.revision,
-            g.invite_link_password,
-            g.access_control,
-            g.avatar,
-            g.description,
-            g.members,
-            g.pending_members,
-            g.requesting_members,
+                requesting_members,
+                disappearing_messages_timer
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
+        .bind(master_key)
+        .bind(g.title)
+        .bind(g.revision)
+        .bind(g.invite_link_password)
+        .bind(g.access_control)
+        .bind(g.avatar)
+        .bind(g.description)
+        .bind(g.members)
+        .bind(g.pending_members)
+        .bind(g.requesting_members)
+        .bind(g.disappearing_messages_timer)
         .execute(&self.db)
         .await?;
         Ok(())
@@ -465,7 +468,8 @@ impl ContentsStore for SqliteStore {
                 description,
                 members AS "members: _",
                 pending_members AS "pending_members: _",
-                requesting_members AS "requesting_members: _"
+                requesting_members AS "requesting_members: _",
+                disappearing_messages_timer
             FROM groups"#,
         )
         .fetch_all(&self.db)
@@ -490,7 +494,8 @@ impl ContentsStore for SqliteStore {
                 description,
                 members AS "members: _",
                 pending_members AS "pending_members: _",
-                requesting_members AS "requesting_members: _"
+                requesting_members AS "requesting_members: _",
+                disappearing_messages_timer
             FROM groups
             WHERE master_key = ?
             LIMIT 1"#,
@@ -697,6 +702,31 @@ impl ContentsStore for SqliteStore {
         .fetch_all(&self.db)
         .await?;
         Ok(Box::new(sql_packs.into_iter().map(|pack| Ok(pack.into()))))
+    }
+
+    async fn thread_for_sender_and_timestamp(
+        &self,
+        sender: &ServiceId,
+        timestamp: u64,
+    ) -> Result<Option<Thread>, Self::ContentsStoreError> {
+        let timestamp: i64 = timestamp
+            .try_into()
+            .map_err(|_| SqliteStoreError::InvalidFormat)?;
+        let sender_service_id = sender.service_id_string();
+        let thread = query!(r#"SELECT group_master_key, recipient_id AS "recipient_id: Uuid" FROM threads JOIN thread_messages ON threads.id = thread_messages.thread_id WHERE sender_service_id = ? AND ts = ?"#, sender_service_id, timestamp)
+            .fetch_optional(&self.db).await?;
+
+        let Some(thread) = thread else {
+            return Ok(None);
+        };
+
+        match (thread.group_master_key, thread.recipient_id) {
+            (Some(group_master_key), None) => {
+                Ok(group_master_key.try_into().ok().map(Thread::Group))
+            }
+            (None, Some(contact)) => Ok(Some(Thread::Contact(ServiceId::Aci(contact.into())))),
+            _ => panic!("Thread table stored both group master key and recipient"),
+        }
     }
 }
 

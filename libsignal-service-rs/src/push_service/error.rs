@@ -1,12 +1,13 @@
-use aes::cipher::block_padding::UnpadError;
+use aes::cipher::block_padding;
 use libsignal_core::curve::CurveError;
 use libsignal_protocol::{
     FingerprintError, ServiceIdKind, SignalProtocolError,
 };
+use reqwest::StatusCode;
 use zkgroup::{ZkGroupDeserializationFailure, ZkGroupVerificationFailure};
 
 use crate::{
-    groups_v2::GroupDecodingError,
+    cipher::SealedSenderDecryptionError, groups_v2::GroupDecodingError,
     websocket::registration::RegistrationLockFailure,
 };
 
@@ -49,8 +50,9 @@ pub enum ServiceError {
     Unauthorized,
     #[error("Registration lock is set: {0:?}")]
     Locked(RegistrationLockFailure),
-    #[error("Unexpected response: HTTP {http_code}")]
-    UnhandledResponseCode { http_code: u16 },
+
+    #[error("Unexpected response: HTTP {status}: {body}")]
+    UnhandledResponseCode { status: StatusCode, body: String },
 
     #[error("Websocket error: {0}")]
     WsError(Box<reqwest_websocket::Error>),
@@ -58,7 +60,7 @@ pub enum ServiceError {
     WsClosing { reason: &'static str },
 
     #[error("Invalid padding: {0}")]
-    Padding(#[from] UnpadError),
+    Padding(#[from] block_padding::Error),
 
     #[error("unknown padding version {0}")]
     PaddingVersion(u32),
@@ -71,6 +73,9 @@ pub enum ServiceError {
 
     #[error("Protocol error: {0}")]
     SignalProtocolError(#[from] SignalProtocolError),
+
+    #[error("Sealed sender decryption error: {0}")]
+    SealedSenderDecryptionError(#[from] SealedSenderDecryptionError),
 
     #[error("invalid device id: {0}")]
     InvalidDeviceId(#[from] libsignal_core::InvalidDeviceId),

@@ -1,15 +1,11 @@
-use std::sync::Arc;
-
 use libsignal_service::configuration::SignalServers;
-use libsignal_service::messagepipe::ServiceCredentials;
 use libsignal_service::prelude::phonenumber::PhoneNumber;
-use libsignal_service::prelude::PushService;
 use libsignal_service::protocol::IdentityKeyPair;
 use libsignal_service::provisioning::generate_registration_id;
 use libsignal_service::push_service::ServiceIds;
-use libsignal_service::utils::TryIntoE164;
 use libsignal_service::websocket::account::{AccountAttributes, DeviceCapabilities};
 use libsignal_service::websocket::registration::{RegistrationMethod, VerifyAccountResponse};
+use libsignal_service::websocket::{SignalWebSocket, Unidentified};
 use libsignal_service::zkgroup::profiles::ProfileKey;
 use rand::RngCore;
 use tracing::trace;
@@ -29,6 +25,7 @@ pub struct Confirmation {
     pub(crate) phone_number: PhoneNumber,
     pub(crate) password: String,
     pub(crate) session_id: String,
+    pub(crate) unidentified_websocket: SignalWebSocket<Unidentified>,
 }
 
 impl<S: Store> Manager<S, Confirmation> {
@@ -53,21 +50,11 @@ impl<S: Store> Manager<S, Confirmation> {
             phone_number,
             password,
             session_id,
-        } = &*self.state;
+            mut unidentified_websocket,
+        } = self.state;
 
-        let credentials = ServiceCredentials {
-            aci: None,
-            pni: None,
-            phonenumber: phone_number.try_into_e164().expect("valid phone number"),
-            password: Some(password.clone()),
-            device_id: None,
-        };
-
-        let identified_push_service =
-            PushService::new(*signal_servers, Some(credentials), crate::USER_AGENT);
-
-        let session = identified_push_service
-            .submit_verification_code(session_id, confirmation_code.as_ref())
+        let session = unidentified_websocket
+            .submit_verification_code(&session_id, confirmation_code.as_ref())
             .await?;
 
         trace!("verification code submitted");
@@ -75,10 +62,6 @@ impl<S: Store> Manager<S, Confirmation> {
         if !session.verified {
             return Err(Error::UnverifiedRegistrationSession);
         }
-
-        // generate a 52 bytes signaling key
-        let mut signaling_key = [0u8; 52];
-        rng.fill_bytes(&mut signaling_key);
 
         // generate a 32 bytes profile key
         let mut profile_key = [0u8; 32];
@@ -94,49 +77,58 @@ impl<S: Store> Manager<S, Confirmation> {
             .await?;
 
         let skip_device_transfer = true;
-        let account_attributes = AccountAttributes {
-            fetches_messages: true,
-            registration_id,
-            pni_registration_id,
-            name: None,
-            registration_lock: None,
-            unidentified_access_key: Some(profile_key.derive_access_key().to_vec()),
-            unrestricted_unidentified_access: false, // TODO: make this configurable?
-            capabilities: DeviceCapabilities::default(),
-            discoverable_by_phone_number: true,
-            pin: None,
-            recovery_password: None,
-        };
-
         let VerifyAccountResponse {
             aci,
             pni,
             storage_capable: _,
             number: _,
-        } = identified_push_service
+        } = unidentified_websocket
             .register_account(
                 &mut rng,
                 RegistrationMethod::SessionId(&session.id),
-                account_attributes,
+                None, // No GCM token
+                AccountAttributes {
+                    fetches_messages: true,
+                    registration_id,
+                    pni_registration_id,
+                    name: None,
+                    registration_lock: None,
+                    unidentified_access_key: Some(profile_key.derive_access_key().to_vec()),
+                    unrestricted_unidentified_access: false, // TODO: make this configurable?
+                    capabilities: Some(DeviceCapabilities {
+                        storage: true,
+                        transfer: false,
+                        attachment_backfill: false,
+                        spqr: true,
+                        profiles_v2: false,
+                        username_change_sync_message: true,
+                    }),
+                    discoverable_by_phone_number: true,
+                    recovery_password: None,
+                    video: false,
+                    voice: false,
+                },
                 &mut self.store.aci_protocol_store(),
                 &mut self.store.pni_protocol_store(),
                 skip_device_transfer,
+                phone_number.clone(),
+                &password,
             )
             .await?;
 
         let mut manager = Manager {
             store: self.store,
-            state: Arc::new(Registered::with_data(RegistrationData {
-                signal_servers: self.state.signal_servers,
+            state: Registered::with_data(RegistrationData {
+                signal_servers,
                 device_name: None,
-                phone_number: phone_number.clone(),
+                phone_number,
                 service_ids: ServiceIds { aci, pni },
-                password: password.clone(),
+                password,
                 device_id: None,
                 registration_id,
                 pni_registration_id: Some(pni_registration_id),
                 profile_key,
-            })),
+            }),
         };
 
         manager
