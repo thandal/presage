@@ -30,6 +30,10 @@ fn main() {
 
     let mut prost_build = prost_build::Config::new();
     prost_build
+        .protoc_executable(
+            protoc_bin_vendored::protoc_bin_path()
+                .expect("vendored protoc binary"),
+        )
         .default_package_filename("signal")
         .compile_protos(&input, &[protobuf])
         .unwrap();
