@@ -730,6 +730,57 @@ impl ContentsStore for SqliteStore {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use presage::{
+        libsignal_service::{prelude::Timer, zkgroup::GroupMasterKeyBytes},
+        model::{groups::Group, identity::OnNewIdentity},
+        store::ContentsStore,
+    };
+
+    use crate::SqliteStore;
+
+    fn group_with_timer(duration: Option<u32>) -> Group {
+        Group {
+            title: "Timer test".to_owned(),
+            avatar: String::new(),
+            disappearing_messages_timer: duration.map(|duration| Timer { duration }),
+            access_control: None,
+            revision: 1,
+            members: Vec::new(),
+            pending_members: Vec::new(),
+            requesting_members: Vec::new(),
+            invite_link_password: Vec::new(),
+            description: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn group_disappearing_message_timer_round_trips() {
+        let store = SqliteStore::open(":memory:", OnNewIdentity::Trust)
+            .await
+            .unwrap();
+        let master_key = GroupMasterKeyBytes::from([42; 32]);
+
+        store
+            .save_group(master_key, group_with_timer(Some(3600)))
+            .await
+            .unwrap();
+        let stored = store.group(master_key).await.unwrap().unwrap();
+        assert_eq!(
+            stored.disappearing_messages_timer,
+            Some(Timer { duration: 3600 })
+        );
+
+        store
+            .save_group(master_key, group_with_timer(None))
+            .await
+            .unwrap();
+        let stored = store.group(master_key).await.unwrap().unwrap();
+        assert_eq!(stored.disappearing_messages_timer, None);
+    }
+}
+
 trait ThreadExt {
     fn group_master_key(&self) -> Option<&[u8]>;
     fn recipient_id(&self) -> Option<Uuid>;

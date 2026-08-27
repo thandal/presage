@@ -1335,9 +1335,6 @@ impl<S: Store> Manager<S, Registered> {
             .expect("Master key bytes to be of size 32.");
         let thread = Thread::Group(master_key_bytes);
 
-        self.restore_thread_timer(&thread, &mut content_body).await;
-        ensure_data_message_timestamp(&mut content_body, timestamp);
-
         let mut sender = self.new_message_sender().await?;
 
         let mut groups_manager = Box::pin(self.groups_manager()).await?;
@@ -1346,6 +1343,11 @@ impl<S: Store> Manager<S, Registered> {
         else {
             return Err(Error::UnknownGroup);
         };
+
+        // Restore the timer only after upserting the group. On the first send to an
+        // uncached group, the upsert is what persists its disappearing-message timer.
+        self.restore_thread_timer(&thread, &mut content_body).await;
+        ensure_data_message_timestamp(&mut content_body, timestamp);
 
         let sender_certificate = self.sender_certificate().await?;
         let mut recipients = Vec::new();
