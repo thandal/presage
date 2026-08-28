@@ -232,6 +232,48 @@ impl PreKeyStore for SqliteProtocolStore {
 
 #[async_trait(?Send)]
 impl PreKeysStore for SqliteProtocolStore {
+    /// Analogue of Android's markAllOneTimeEcPreKeysStaleIfNecessary
+    async fn mark_all_one_time_ec_pre_keys_stale_if_necessary(
+        &mut self,
+        stale_time: DateTime<Utc>,
+    ) -> Result<(), SignalProtocolError> {
+        let stale_time = stale_time.timestamp_millis();
+        query!(
+            "UPDATE pre_keys SET stale_timestamp = ?
+            WHERE identity = ? AND stale_timestamp IS NULL",
+            stale_time,
+            self.identity,
+        )
+        .execute(&self.store.db)
+        .await
+        .into_protocol_error()?;
+        Ok(())
+    }
+
+    /// Analogue of Android's deleteAllStaleOneTimeEcPreKeys
+    async fn delete_all_stale_one_time_ec_pre_keys(
+        &mut self,
+        threshold: DateTime<Utc>,
+        min_count: usize,
+    ) -> Result<(), SignalProtocolError> {
+        let threshold = threshold.timestamp_millis();
+        let min_count: i64 = min_count.try_into().expect("min_count overflow");
+        query!(
+            "DELETE FROM pre_keys
+            WHERE identity = ?1 AND stale_timestamp < ?2 AND id NOT IN (
+                SELECT id FROM pre_keys WHERE identity = ?1
+                ORDER BY id DESC LIMIT ?3
+            )",
+            self.identity,
+            threshold,
+            min_count,
+        )
+        .execute(&self.store.db)
+        .await
+        .into_protocol_error()?;
+        Ok(())
+    }
+
     /// ID of the next pre key
     async fn next_pre_key_id(&self) -> Result<u32, SignalProtocolError> {
         let max_id = query_scalar!(
@@ -529,18 +571,46 @@ impl KyberPreKeyStoreExt for SqliteProtocolStore {
     /// Analogous to markAllOneTimeKyberPreKeysStaleIfNecessary
     async fn mark_all_one_time_kyber_pre_keys_stale_if_necessary(
         &mut self,
-        _stale_time: DateTime<Utc>,
+        stale_time: DateTime<Utc>,
     ) -> Result<(), SignalProtocolError> {
-        unimplemented!("should not be used yet")
+        let stale_time = stale_time.timestamp_millis();
+        query!(
+            "UPDATE kyber_pre_keys SET stale_timestamp = ?
+            WHERE identity = ? AND is_last_resort = FALSE
+            AND stale_timestamp IS NULL",
+            stale_time,
+            self.identity,
+        )
+        .execute(&self.store.db)
+        .await
+        .into_protocol_error()?;
+        Ok(())
     }
 
     /// Analogue of deleteAllStaleOneTimeKyberPreKeys
     async fn delete_all_stale_one_time_kyber_pre_keys(
         &mut self,
-        _threshold: DateTime<Utc>,
-        _min_count: usize,
+        threshold: DateTime<Utc>,
+        min_count: usize,
     ) -> Result<(), SignalProtocolError> {
-        unimplemented!("should not be used yet")
+        let threshold = threshold.timestamp_millis();
+        let min_count: i64 = min_count.try_into().expect("min_count overflow");
+        query!(
+            "DELETE FROM kyber_pre_keys
+            WHERE identity = ?1 AND is_last_resort = FALSE
+            AND stale_timestamp < ?2 AND id NOT IN (
+                SELECT id FROM kyber_pre_keys
+                WHERE identity = ?1 AND is_last_resort = FALSE
+                ORDER BY id DESC LIMIT ?3
+            )",
+            self.identity,
+            threshold,
+            min_count,
+        )
+        .execute(&self.store.db)
+        .await
+        .into_protocol_error()?;
+        Ok(())
     }
 }
 
@@ -805,6 +875,104 @@ mod test {
                 .await
                 .is_err()
         );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn stale_one_time_pre_keys_lifecycle() -> Result<(), Box<dyn std::error::Error>> {
+        let mut rng = rand::rng();
+        let sqlite_store = SqliteStore::open(":memory:", OnNewIdentity::Trust).await?;
+        let mut protocol_store = SqliteProtocolStore {
+            store: sqlite_store,
+            identity: IdentityType::Aci,
+        };
+
+        let keypair = KeyPair::generate(&mut rng);
+        let mut save_one_time = async |store: &mut SqliteProtocolStore,
+                                       id: u32|
+               -> Result<(), Box<dyn std::error::Error>> {
+            let ec_record =
+                PreKeyRecord::new(id.into(), &KeyPair::generate(&mut rand::rng()));
+            store.save_pre_key(id.into(), &ec_record).await?;
+            let kyber_record = KyberPreKeyRecord::generate(
+                presage::libsignal_service::protocol::kem::KeyType::Kyber1024,
+                id.into(),
+                &keypair.private_key,
+            )?;
+            store.save_kyber_pre_key(id.into(), &kyber_record).await?;
+            Ok(())
+        };
+
+        for id in 1..=5 {
+            save_one_time(&mut protocol_store, id).await?;
+        }
+        let last_resort = KyberPreKeyRecord::generate(
+            presage::libsignal_service::protocol::kem::KeyType::Kyber1024,
+            KyberPreKeyId::from(10),
+            &keypair.private_key,
+        )?;
+        protocol_store
+            .store_last_resort_kyber_pre_key(10.into(), &last_resort)
+            .await?;
+
+        let t0 = Utc::now();
+        protocol_store
+            .mark_all_one_time_ec_pre_keys_stale_if_necessary(t0)
+            .await?;
+        protocol_store
+            .mark_all_one_time_kyber_pre_keys_stale_if_necessary(t0)
+            .await?;
+        // A later marking must not overwrite the existing stamps: deleting
+        // with a threshold between t0 and this re-mark still deletes.
+        protocol_store
+            .mark_all_one_time_ec_pre_keys_stale_if_necessary(t0 + chrono::Duration::hours(2))
+            .await?;
+        protocol_store
+            .mark_all_one_time_kyber_pre_keys_stale_if_necessary(t0 + chrono::Duration::hours(2))
+            .await?;
+
+        // A fresh, unstamped batch.
+        for id in 6..=8 {
+            save_one_time(&mut protocol_store, id).await?;
+        }
+
+        let threshold = t0 + chrono::Duration::hours(1);
+        protocol_store
+            .delete_all_stale_one_time_ec_pre_keys(threshold, 4)
+            .await?;
+        protocol_store
+            .delete_all_stale_one_time_kyber_pre_keys(threshold, 4)
+            .await?;
+
+        // Stamped keys past the threshold are gone, except the newest-4 floor
+        // (8, 7, 6, 5); the last-resort key does not use up a floor slot.
+        for id in 1..=4u32 {
+            assert!(protocol_store.get_pre_key(id.into()).await.is_err());
+            assert!(protocol_store.get_kyber_pre_key(id.into()).await.is_err());
+        }
+        for id in 5..=8u32 {
+            assert!(protocol_store.get_pre_key(id.into()).await.is_ok());
+            assert!(protocol_store.get_kyber_pre_key(id.into()).await.is_ok());
+        }
+        assert!(protocol_store.get_kyber_pre_key(10.into()).await.is_ok());
+
+        // Unstamped keys survive any threshold; last-resort keys survive even
+        // with no floor.
+        let far_future = t0 + chrono::Duration::days(365);
+        protocol_store
+            .delete_all_stale_one_time_ec_pre_keys(far_future, 0)
+            .await?;
+        protocol_store
+            .delete_all_stale_one_time_kyber_pre_keys(far_future, 0)
+            .await?;
+        assert!(protocol_store.get_pre_key(5.into()).await.is_err());
+        assert!(protocol_store.get_kyber_pre_key(5.into()).await.is_err());
+        for id in 6..=8u32 {
+            assert!(protocol_store.get_pre_key(id.into()).await.is_ok());
+            assert!(protocol_store.get_kyber_pre_key(id.into()).await.is_ok());
+        }
+        assert!(protocol_store.get_kyber_pre_key(10.into()).await.is_ok());
 
         Ok(())
     }

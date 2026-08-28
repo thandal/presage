@@ -22,7 +22,8 @@ use zkgroup::profiles::ProfileKey;
 use crate::content::ContentBody;
 use crate::pre_keys::{
     KyberPreKeyEntity, PreKeyEntity, PreKeysStore, SignedPreKeyEntity,
-    PRE_KEY_BATCH_SIZE, PRE_KEY_MINIMUM,
+    PRE_KEY_BATCH_SIZE, PRE_KEY_MINIMUM, STALE_PRE_KEY_MAX_AGE_DAYS,
+    STALE_PRE_KEY_MINIMUM_KEPT,
 };
 use crate::prelude::{MessageSender, MessageSenderError};
 use crate::proto::sync_message::PniChangeNumber;
@@ -149,6 +150,23 @@ impl AccountManager {
         service_id_kind: ServiceIdKind,
         use_last_resort_key: bool,
     ) -> Result<(), ServiceError> {
+        // Retire one-time pre-keys that were superseded on the server long
+        // enough ago that no still-queued message can reference them.
+        let stale_threshold = chrono::Utc::now()
+            - chrono::Duration::days(STALE_PRE_KEY_MAX_AGE_DAYS);
+        protocol_store
+            .delete_all_stale_one_time_ec_pre_keys(
+                stale_threshold,
+                STALE_PRE_KEY_MINIMUM_KEPT,
+            )
+            .await?;
+        protocol_store
+            .delete_all_stale_one_time_kyber_pre_keys(
+                stale_threshold,
+                STALE_PRE_KEY_MINIMUM_KEPT,
+            )
+            .await?;
+
         let prekey_status = match self
             .websocket
             .get_pre_key_status(service_id_kind)
@@ -221,6 +239,20 @@ impl AccountManager {
 
         // XXX: Maybe this check should be done in the generate_pre_keys function?
         let has_last_resort_key = !last_resort_keys.is_empty();
+
+        // The upload below replaces the one-time pre-keys on the server, so
+        // every one-time key stored up to now is superseded; stamp the ones
+        // not already stamped. The fresh batch is generated and saved after
+        // this point and stays unstamped. If the upload fails the stamp is
+        // premature, but the server's still-live batch only becomes deletable
+        // after a full stale window of continuously failing uploads.
+        let now = chrono::Utc::now();
+        protocol_store
+            .mark_all_one_time_ec_pre_keys_stale_if_necessary(now)
+            .await?;
+        protocol_store
+            .mark_all_one_time_kyber_pre_keys_stale_if_necessary(now)
+            .await?;
 
         let (pre_keys, signed_pre_key, pq_pre_keys, pq_last_resort_key) =
             crate::pre_keys::replenish_pre_keys(

@@ -198,6 +198,23 @@ impl IdentityKeyStore for ExampleStore {
 #[async_trait::async_trait(?Send)]
 #[allow(clippy::diverging_sub_expression)]
 impl PreKeysStore for ExampleStore {
+    /// Analogue of Android's markAllOneTimeEcPreKeysStaleIfNecessary
+    async fn mark_all_one_time_ec_pre_keys_stale_if_necessary(
+        &mut self,
+        _stale_time: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), SignalProtocolError> {
+        todo!()
+    }
+
+    /// Analogue of Android's deleteAllStaleOneTimeEcPreKeys
+    async fn delete_all_stale_one_time_ec_pre_keys(
+        &mut self,
+        _threshold: chrono::DateTime<chrono::Utc>,
+        _min_count: usize,
+    ) -> Result<(), SignalProtocolError> {
+        todo!()
+    }
+
     /// ID of the next pre key
     async fn next_pre_key_id(&self) -> Result<u32, SignalProtocolError> {
         todo!()

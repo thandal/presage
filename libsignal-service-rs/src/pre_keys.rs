@@ -61,6 +61,19 @@ pub trait PreKeysStore:
     + KyberPreKeyStore
     + KyberPreKeyStoreExt
 {
+    /// Analogue of Android's markAllOneTimeEcPreKeysStaleIfNecessary
+    async fn mark_all_one_time_ec_pre_keys_stale_if_necessary(
+        &mut self,
+        stale_time: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), SignalProtocolError>;
+
+    /// Analogue of Android's deleteAllStaleOneTimeEcPreKeys
+    async fn delete_all_stale_one_time_ec_pre_keys(
+        &mut self,
+        threshold: chrono::DateTime<chrono::Utc>,
+        min_count: usize,
+    ) -> Result<(), SignalProtocolError>;
+
     /// ID of the next pre key
     async fn next_pre_key_id(&self) -> Result<u32, SignalProtocolError>;
 
@@ -183,6 +196,15 @@ pub struct PreKeyState {
 pub(crate) const PRE_KEY_MINIMUM: u32 = 10;
 pub(crate) const PRE_KEY_BATCH_SIZE: u32 = 100;
 pub(crate) const PRE_KEY_MEDIUM_MAX_VALUE: u32 = 0xFFFFFF;
+
+/// Days a superseded one-time pre-key is kept before deletion. A superseded
+/// key can only be referenced by messages already queued on the server, so
+/// this only needs to comfortably exceed the server's message retention.
+pub(crate) const STALE_PRE_KEY_MAX_AGE_DAYS: i64 = 30;
+/// Newest one-time pre-keys always kept per identity, stale or not; covers
+/// the batch currently live on the server.
+pub(crate) const STALE_PRE_KEY_MINIMUM_KEPT: usize =
+    PRE_KEY_BATCH_SIZE as usize;
 
 pub(crate) async fn replenish_pre_keys<R: Rng + CryptoRng, P: PreKeysStore>(
     protocol_store: &mut P,
