@@ -1673,8 +1673,11 @@ impl<S: Store> Manager<S, Registered> {
             self.state
                 .service_configuration()
                 .unidentified_sender_trust_roots,
+            // Must carry the "PNI:" prefix: the cipher parses this name back into a
+            // ServiceId, and a bare UUID parses as an ACI, so every PNI-addressed
+            // envelope would fail the destination check.
             ProtocolAddress::new(
-                self.state.data.service_ids.pni.to_string(),
+                self.state.data.service_ids.pni().service_id_string(),
                 self.state.device_id(),
             ),
         )
